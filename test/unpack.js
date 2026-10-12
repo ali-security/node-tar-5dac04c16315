@@ -3415,8 +3415,9 @@ t.test('drive-relative paths do not escape the extraction target', t => {
     '',
   ])
 
-  const msg = process.platform === 'win32' ? 'path contains \'..\''
-    : 'path escaped extraction target'
+  // the '..' check runs once the drive root is stripped, so it catches
+  // these on every platform, not just on windows
+  const msg = 'path contains \'..\''
 
   const check = (t, base, warnings) => {
     const cwd = base + '/cwd'
@@ -3825,8 +3826,7 @@ t.test('linkpath may not use .. to escape the extraction directory', {
 
     t.strictSame(sanitized(warnings), [
       ['TAR_ENTRY_ERROR', 'linkpath contains \'..\'', '../secret.txt'],
-      ['TAR_ENTRY_ERROR', 'linkpath escapes extraction directory',
-        'c:../secret.txt'],
+      ['TAR_ENTRY_ERROR', 'linkpath contains \'..\'', 'c:../secret.txt'],
       ['TAR_ENTRY_ERROR', 'linkpath escapes extraction directory', '..'],
       ['TAR_ENTRY_ERROR', 'linkpath escapes extraction directory',
         '../../escape'],
@@ -3876,6 +3876,212 @@ t.test('linkpath may not use .. to escape the extraction directory', {
     t.equal(fs.readlinkSync(cwd + '/a/link'), '/../a/target',
       'the absolute symbolic link target is preserved')
     t.strictSame(sanitized(warnings), [], 'no linkpath warnings')
+    t.end()
+  })
+
+  t.end()
+})
+
+// CVE-2026-29786: the '..' check used to look at the path or linkpath exactly
+// as the archive spelled it, before the root was stripped off.  A
+// drive-relative value like 'c:../x' has no '..' part until its 'c:' root is
+// gone, a doubled root like 'c:c:../x' gets past the windows-only 'c:..'
+// test, and 'c:..\x' has no '..' part at all until the backslash is read as
+// the separator it is on windows.  Once the root is stripped, every one of
+// them is left pointing outside the extraction target, so the check has to
+// run on what is left after stripping, with backslashes treated as '/'.
+t.test('drive-relative .. is refused once the root is stripped', {
+  skip: process.platform === 'win32' && 'symlinks not fully supported',
+}, t => {
+  const dir = path.resolve(unpackdir, 'drive-relative-dots')
+  const SECRET = 'ORIGINAL DATA'
+  t.teardown(() => rimraf.sync(dir))
+
+  const data = makeTar([
+    {
+      path: 'c:../escaped-file',
+      type: 'File',
+      size: 'pwned'.length,
+    },
+    'pwned',
+    {
+      path: 'C:..\\escaped-backslash',
+      type: 'File',
+      size: 'pwned'.length,
+    },
+    'pwned',
+    {
+      path: 'c:c:../escaped-twice',
+      type: 'File',
+      size: 'pwned'.length,
+    },
+    'pwned',
+    {
+      path: 'hard_drive',
+      type: 'Link',
+      linkpath: 'c:../secret.txt',
+    },
+    {
+      path: 'hard_backslash',
+      type: 'Link',
+      linkpath: 'C:..\\secret.txt',
+    },
+    {
+      path: 'hard_twice',
+      type: 'Link',
+      linkpath: 'c:c:../secret.txt',
+    },
+    // a drive root with no '..' behind it is still just stripped off
+    {
+      path: 'c:safe',
+      type: 'File',
+      size: 'safe'.length,
+    },
+    'safe',
+    {
+      path: 'safe_link',
+      type: 'Link',
+      linkpath: 'c:safe',
+    },
+    // and a symbolic link may still use '..' to point at a file in cwd
+    {
+      path: 'sub/sym',
+      type: 'SymbolicLink',
+      linkpath: 'c:../safe',
+    },
+    '',
+    '',
+  ])
+
+  // extract into <base>/x, with the file the links are aimed at in <base>
+  const setup = leg => {
+    const base = path.resolve(dir, leg)
+    rimraf.sync(base)
+    mkdirp.sync(base + '/x')
+    fs.writeFileSync(base + '/secret.txt', SECRET)
+    return base
+  }
+
+  const check = (t, base, warnings) => {
+    const cwd = base + '/x'
+    t.strictSame(warnings, [
+      ['TAR_ENTRY_ERROR', 'path contains \'..\'', 'c:../escaped-file'],
+      ['TAR_ENTRY_ERROR', 'path contains \'..\'', 'C:..\\escaped-backslash'],
+      ['TAR_ENTRY_ERROR', 'path contains \'..\'', 'c:c:../escaped-twice'],
+      ['TAR_ENTRY_ERROR', 'linkpath contains \'..\'', 'c:../secret.txt'],
+      ['TAR_ENTRY_ERROR', 'linkpath contains \'..\'', 'C:..\\secret.txt'],
+      ['TAR_ENTRY_ERROR', 'linkpath contains \'..\'', 'c:c:../secret.txt'],
+      ['TAR_ENTRY_INFO', 'stripping c: from absolute path', 'c:safe'],
+      ['TAR_ENTRY_INFO', 'stripping c: from absolute linkpath', 'c:safe'],
+      ['TAR_ENTRY_INFO', 'stripping c: from absolute linkpath', 'c:../safe'],
+    ], 'every drive-relative .. entry is refused')
+
+    t.strictSame(fs.readdirSync(base).sort(), ['secret.txt', 'x'],
+      'nothing written outside of the extraction directory')
+    t.strictSame(fs.readdirSync(cwd).sort(), ['safe', 'safe_link', 'sub'],
+      'only the benign entries were extracted')
+
+    t.throws(() => fs.lstatSync(cwd + '/hard_drive'), { code: 'ENOENT' },
+      'no hard link made to the drive-relative target')
+    t.throws(() => fs.lstatSync(cwd + '/hard_backslash'), { code: 'ENOENT' },
+      'no hard link made to the drive-relative backslash target')
+    t.throws(() => fs.lstatSync(cwd + '/hard_twice'), { code: 'ENOENT' },
+      'no hard link made to the doubled drive-relative target')
+    fs.writeFileSync(cwd + '/hard_drive', 'OVERWRITTEN')
+    fs.writeFileSync(cwd + '/hard_backslash', 'OVERWRITTEN')
+    fs.writeFileSync(cwd + '/hard_twice', 'OVERWRITTEN')
+    t.equal(fs.readFileSync(base + '/secret.txt', 'utf8'), SECRET,
+      'the file outside the extraction directory is not overwritten')
+
+    t.equal(fs.readFileSync(cwd + '/safe', 'utf8'), 'safe')
+    t.equal(fs.statSync(cwd + '/safe_link').ino, fs.statSync(cwd + '/safe').ino,
+      'drive-relative hard link inside cwd is still made')
+    t.equal(fs.readlinkSync(cwd + '/sub/sym'), '../safe',
+      'drive-relative symbolic link inside cwd is still made')
+    t.equal(fs.readFileSync(cwd + '/sub/sym', 'utf8'), 'safe')
+    t.end()
+  }
+
+  t.test('async', t => {
+    const base = setup('async')
+    const warnings = []
+    new Unpack({
+      cwd: base + '/x',
+      onwarn: (c, w, d) => warnings.push([c, w, d.linkpath || d.path]),
+    }).on('close', () => check(t, base, warnings)).end(data)
+  })
+
+  t.test('sync', t => {
+    const base = setup('sync')
+    const warnings = []
+    new UnpackSync({
+      cwd: base + '/x',
+      onwarn: (c, w, d) => warnings.push([c, w, d.linkpath || d.path]),
+    }).end(data)
+    check(t, base, warnings)
+  })
+
+  t.test('win32', t => {
+    // on windows the backslash is a separator, so the regular expression on
+    // the first part used to be all that stood in the way of 'C:..', and a
+    // doubled root walked right past it.
+    const WinUnpack = loadWinUnpack()
+    const winData = makeTar([
+      {
+        path: 'C:C:..\\escaped-file',
+        type: 'File',
+        size: 'pwned'.length,
+      },
+      'pwned',
+      {
+        path: 'hard_drive',
+        type: 'Link',
+        linkpath: 'C:C:..\\secret.txt',
+      },
+      {
+        path: 'C:safe',
+        type: 'File',
+        size: 'safe'.length,
+      },
+      'safe',
+      '',
+      '',
+    ])
+
+    const winCheck = (t, base, warnings) => {
+      const cwd = base + '/x'
+      t.strictSame(warnings, [
+        ['TAR_ENTRY_ERROR', 'path contains \'..\'', 'C:C:../escaped-file'],
+        ['TAR_ENTRY_ERROR', 'linkpath contains \'..\'', 'C:C:../secret.txt'],
+        ['TAR_ENTRY_INFO', 'stripping C: from absolute path', 'C:safe'],
+      ], 'every drive-relative .. entry is refused')
+      t.strictSame(fs.readdirSync(base).sort(), ['secret.txt', 'x'],
+        'nothing written outside of the extraction directory')
+      t.strictSame(fs.readdirSync(cwd), ['safe'],
+        'only the benign entry was extracted')
+      t.equal(fs.readFileSync(base + '/secret.txt', 'utf8'), SECRET)
+      t.end()
+    }
+
+    t.test('async', t => {
+      const base = setup('win32-async')
+      const warnings = []
+      new WinUnpack({
+        cwd: base + '/x',
+        onwarn: (c, w, d) => warnings.push([c, w, d.linkpath || d.path]),
+      }).on('close', () => winCheck(t, base, warnings)).end(winData)
+    })
+
+    t.test('sync', t => {
+      const base = setup('win32-sync')
+      const warnings = []
+      new WinUnpack.Sync({
+        cwd: base + '/x',
+        onwarn: (c, w, d) => warnings.push([c, w, d.linkpath || d.path]),
+      }).end(winData)
+      winCheck(t, base, warnings)
+    })
+
     t.end()
   })
 
