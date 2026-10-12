@@ -4582,3 +4582,103 @@ t.test('links with no symlink in the way are still made', {
 
   t.end()
 })
+
+// CVE-2026-59875: a NUL byte inside a pax path or linkpath value was kept
+// as-is, and handing such a path to fs throws ERR_INVALID_ARG_VALUE outside
+// of the unpack's error handling, crashing the process.  Every other tar
+// truncates the value at the first NUL, as is already done for header fields
+// and gnu long paths, so do the same.
+t.test('pax path and linkpath are truncated at a NUL byte', {
+  skip: process.platform === 'win32' && 'symlinks not fully supported',
+}, t => {
+  const base = path.resolve(unpackdir, 'pax-nul-byte')
+  t.teardown(() => rimraf.sync(base))
+
+  const filePax = new Pax({ path: 'visible.txt\0hidden.txt' }).encodeBody()
+  const symPax = new Pax({ linkpath: 'visible.txt\0garbage' }).encodeBody()
+  const hardPax = new Pax({
+    path: 'hard\0garbage',
+    linkpath: 'visible.txt\0garbage',
+  }).encodeBody()
+
+  const data = makeTar([
+    {
+      path: 'PaxHeader/visible.txt',
+      type: 'ExtendedHeader',
+      size: filePax.length,
+    },
+    filePax,
+    {
+      path: 'decoy.txt',
+      type: 'File',
+      size: 'hello'.length,
+    },
+    'hello',
+    {
+      path: 'PaxHeader/sym',
+      type: 'ExtendedHeader',
+      size: symPax.length,
+    },
+    symPax,
+    {
+      path: 'sym',
+      type: 'SymbolicLink',
+      linkpath: 'decoy',
+    },
+    {
+      path: 'PaxHeader/hard',
+      type: 'ExtendedHeader',
+      size: hardPax.length,
+    },
+    hardPax,
+    {
+      path: 'decoy-hard',
+      type: 'Link',
+      linkpath: 'decoy',
+    },
+    '',
+    '',
+  ])
+
+  const setup = leg => {
+    const cwd = path.resolve(base, leg)
+    rimraf.sync(cwd)
+    mkdirp.sync(cwd)
+    return cwd
+  }
+
+  const check = (t, cwd, warnings) => {
+    t.same(warnings, [], 'no warnings')
+    t.equal(fs.readFileSync(cwd + '/visible.txt', 'utf8'), 'hello',
+      'file path truncated at the NUL')
+    t.equal(fs.readlinkSync(cwd + '/sym'), 'visible.txt',
+      'symlink target truncated at the NUL')
+    t.equal(fs.statSync(cwd + '/hard').ino,
+      fs.statSync(cwd + '/visible.txt').ino,
+      'hard link path and target truncated at the NUL')
+    t.same(fs.readdirSync(cwd).sort(), ['hard', 'sym', 'visible.txt'],
+      'nothing else written')
+    t.end()
+  }
+
+  t.test('async', t => {
+    const cwd = setup('async')
+    const warnings = []
+    new Unpack({
+      cwd,
+      onwarn: (c, w) => warnings.push([c, w]),
+    }).on('close', () => check(t, cwd, warnings)).end(data)
+  })
+
+  t.test('sync', t => {
+    const cwd = setup('sync')
+    const warnings = []
+    new UnpackSync({
+      cwd,
+      onwarn: (c, w) => warnings.push([c, w]),
+    }).end(data)
+    check(t, cwd, warnings)
+  })
+
+  t.end()
+})
