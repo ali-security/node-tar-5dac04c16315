@@ -2634,3 +2634,242 @@ t.test('drop entry from dirCache if no longer a directory', t => {
     check(t, path)
   })
 })
+
+t.test('do not follow symlinks through backslash-named dirs on posix', {
+  skip: process.platform === 'win32' && 'backslash is a path separator on windows',
+}, t => {
+  const dir = path.resolve(unpackdir, 'backslash-dircache-poison')
+  t.teardown(() => rimraf.sync(dir))
+  const data = makeTar([
+    // a directory whose name contains a backslash, which then gets
+    // clobbered by a symlink pointing outside of the cwd
+    {
+      path: 'x\\y',
+      type: 'Directory',
+    },
+    {
+      path: 'x\\y',
+      type: 'SymbolicLink',
+      linkpath: '../outside',
+    },
+    {
+      path: 'x\\y/z',
+      type: 'File',
+      size: 'poisoned'.length,
+    },
+    'poisoned',
+    // no directory first, just a backslash-named symlink, and then
+    // a file written through it.
+    {
+      path: 'a\\b',
+      type: 'SymbolicLink',
+      linkpath: '../outside',
+    },
+    {
+      path: 'a\\b/c',
+      type: 'File',
+      size: 'poisoned'.length,
+    },
+    'poisoned',
+    '',
+    '',
+  ])
+
+  const check = (t, base, warnings) => {
+    const cwd = base + '/cwd'
+    t.strictSame(fs.readdirSync(base + '/outside'), [],
+      'nothing written outside of cwd')
+    t.equal(fs.lstatSync(cwd + '/x\\y').isSymbolicLink(), true)
+    t.equal(fs.lstatSync(cwd + '/a\\b').isSymbolicLink(), true)
+    t.throws(() => fs.statSync(cwd + '/x'), { code: 'ENOENT' },
+      'backslash not treated as a path separator')
+    t.throws(() => fs.statSync(cwd + '/a'), { code: 'ENOENT' },
+      'backslash not treated as a path separator')
+    t.equal(warnings.length, 2)
+    warnings.forEach(w => {
+      t.equal(w[0], 'TAR_ENTRY_ERROR')
+      t.equal(w[1], 'Cannot extract through symbolic link')
+    })
+    t.end()
+  }
+
+  const setup = base => {
+    rimraf.sync(base)
+    mkdirp.sync(base + '/cwd')
+    mkdirp.sync(base + '/outside')
+  }
+
+  t.test('async', t => {
+    const base = dir + '/async'
+    setup(base)
+    const warnings = []
+    new Unpack({
+      cwd: base + '/cwd',
+      onwarn: (c, w, d) => warnings.push([c, w, d]),
+    }).on('close', () => check(t, base, warnings)).end(data)
+  })
+
+  t.test('sync', t => {
+    const base = dir + '/sync'
+    setup(base)
+    const warnings = []
+    new UnpackSync({
+      cwd: base + '/cwd',
+      onwarn: (c, w, d) => warnings.push([c, w, d]),
+    }).end(data)
+    check(t, base, warnings)
+  })
+
+  t.end()
+})
+
+t.test('prune dirCache case-insensitively', {
+  skip: process.platform === 'win32' && 'symlinks not fully supported',
+}, t => {
+  const dir = path.resolve(unpackdir, 'dircache-case-insensitive')
+  t.teardown(() => rimraf.sync(dir))
+  const data = makeTar([
+    {
+      path: 'FOO',
+      type: 'Directory',
+    },
+    {
+      path: 'FOO/BAR',
+      type: 'Directory',
+    },
+    {
+      path: 'Foo/Baz',
+      type: 'Directory',
+    },
+    // on a case-insensitive filesystem, this clobbers the FOO directory,
+    // so the cached FOO entries must not be trusted any longer.
+    {
+      path: 'foo',
+      type: 'SymbolicLink',
+      linkpath: './target',
+    },
+    '',
+    '',
+  ])
+
+  const check = (t, cwd, dirCache) => {
+    t.notOk(dirCache.has(cwd + '/FOO'), 'FOO pruned from dirCache')
+    t.notOk(dirCache.has(cwd + '/FOO/BAR'), 'FOO/BAR pruned from dirCache')
+    t.notOk(dirCache.has(cwd + '/Foo'), 'Foo pruned from dirCache')
+    t.notOk(dirCache.has(cwd + '/Foo/Baz'), 'Foo/Baz pruned from dirCache')
+    t.equal(dirCache.get(cwd), true, 'cwd remains in dirCache')
+    t.equal(fs.lstatSync(cwd + '/foo').isSymbolicLink(), true)
+    t.end()
+  }
+
+  t.test('async', t => {
+    const cwd = path.resolve(dir, 'async')
+    mkdirp.sync(cwd)
+    const dirCache = new Map()
+    new Unpack({ cwd, dirCache })
+      .on('close', () => check(t, cwd, dirCache))
+      .end(data)
+  })
+
+  t.test('sync', t => {
+    const cwd = path.resolve(dir, 'sync')
+    mkdirp.sync(cwd)
+    const dirCache = new Map()
+    new UnpackSync({ cwd, dirCache }).end(data)
+    check(t, cwd, dirCache)
+  })
+
+  t.end()
+})
+
+t.test('treat backslash as a path separator on windows', {
+  skip: process.platform === 'win32' && 'symlinks not fully supported',
+}, t => {
+  // load a fresh copy of the library with the platform faked as win32,
+  // then put the original modules back so other tests are not affected.
+  const libdir = path.resolve(__dirname, '../lib') + path.sep
+  const libKeys = () => Object.keys(require.cache)
+    .filter(k => k.indexOf(libdir) === 0)
+  const saved = {}
+  libKeys().forEach(k => {
+    saved[k] = require.cache[k]
+    delete require.cache[k]
+  })
+  const fakePlatform = process.env.TESTING_TAR_FAKE_PLATFORM
+  process.env.TESTING_TAR_FAKE_PLATFORM = 'win32'
+  const WinUnpack = require('../lib/unpack.js')
+  if (fakePlatform === undefined)
+    delete process.env.TESTING_TAR_FAKE_PLATFORM
+  else
+    process.env.TESTING_TAR_FAKE_PLATFORM = fakePlatform
+  libKeys().forEach(k => delete require.cache[k])
+  Object.assign(require.cache, saved)
+  t.notEqual(WinUnpack, Unpack, 'got a fresh copy of Unpack')
+
+  const dir = path.resolve(unpackdir, 'win32-backslash')
+  t.teardown(() => rimraf.sync(dir))
+  const data = makeTar([
+    {
+      path: 'x/y',
+      type: 'Directory',
+    },
+    {
+      path: 'x\\y',
+      type: 'SymbolicLink',
+      linkpath: '..\\..\\outside',
+    },
+    {
+      path: 'x\\y\\z',
+      type: 'File',
+      size: 'poisoned'.length,
+    },
+    'poisoned',
+    '',
+    '',
+  ])
+
+  const check = (t, base, warnings) => {
+    const cwd = base + '/cwd'
+    t.strictSame(fs.readdirSync(base + '/outside'), [],
+      'nothing written outside of cwd')
+    t.equal(fs.lstatSync(cwd + '/x/y').isSymbolicLink(), true,
+      'x\\y symlink replaced the x/y directory')
+    t.equal(fs.readlinkSync(cwd + '/x/y'), '../../outside',
+      'linkpath normalized')
+    t.throws(() => fs.lstatSync(cwd + '/x\\y'), { code: 'ENOENT' })
+    t.throws(() => fs.lstatSync(cwd + '/x\\y\\z'), { code: 'ENOENT' })
+    t.equal(warnings.length, 1)
+    t.equal(warnings[0][0], 'TAR_ENTRY_ERROR')
+    t.equal(warnings[0][1], 'Cannot extract through symbolic link')
+    t.end()
+  }
+
+  const setup = base => {
+    rimraf.sync(base)
+    mkdirp.sync(base + '/cwd')
+    mkdirp.sync(base + '/outside')
+  }
+
+  t.test('async', t => {
+    const base = dir + '/async'
+    setup(base)
+    const warnings = []
+    new WinUnpack({
+      cwd: base + '/cwd',
+      onwarn: (c, w, d) => warnings.push([c, w, d]),
+    }).on('close', () => check(t, base, warnings)).end(data)
+  })
+
+  t.test('sync', t => {
+    const base = dir + '/sync'
+    setup(base)
+    const warnings = []
+    new WinUnpack.Sync({
+      cwd: base + '/cwd',
+      onwarn: (c, w, d) => warnings.push([c, w, d]),
+    }).end(data)
+    check(t, base, warnings)
+  })
+
+  t.end()
+})

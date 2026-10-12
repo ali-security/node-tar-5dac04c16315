@@ -49,8 +49,41 @@ t.test('basic race', t => {
   }
 
   t.ok(reserve(['a/b/c/d'], file), 'file starts right away')
-  t.notOk(reserve(['a/b/c/d', 'a/b/e'], link), 'link waits')
+  t.notOk(reserve(['a/B/c////D', 'a/b/e'], link), 'link waits')
   t.notOk(reserve(['a/b/e/f'], dir), 'dir waits')
   t.notOk(reserve(['a/b'], dir2), 'dir2 waits')
   t.notOk(reserve(['a/b/x'], dir3), 'dir3 waits')
+})
+
+t.test('treat backslash as a separator on windows', t => {
+  // load fresh copies of the modules with the platform faked as win32
+  const normPathModule = require.resolve('../lib/normalize-windows-path.js')
+  const resModule = require.resolve('../lib/path-reservations.js')
+  const saved = {
+    [normPathModule]: require.cache[normPathModule],
+    [resModule]: require.cache[resModule],
+  }
+  delete require.cache[normPathModule]
+  delete require.cache[resModule]
+  const fakePlatform = process.env.TESTING_TAR_FAKE_PLATFORM
+  process.env.TESTING_TAR_FAKE_PLATFORM = 'win32'
+  const { reserve } = require('../lib/path-reservations.js')()
+  if (fakePlatform === undefined)
+    delete process.env.TESTING_TAR_FAKE_PLATFORM
+  else
+    process.env.TESTING_TAR_FAKE_PLATFORM = fakePlatform
+  Object.assign(require.cache, saved)
+
+  let didFirst = false
+  const first = done => {
+    didFirst = true
+    setTimeout(done)
+  }
+  const second = done => {
+    t.equal(didFirst, true, 'second waits for first')
+    done()
+    t.end()
+  }
+  t.ok(reserve(['a/b/c'], first), 'first starts right away')
+  t.notOk(reserve(['A\\B\\c\\d'], second), 'second waits')
 })
