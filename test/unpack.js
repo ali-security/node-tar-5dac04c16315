@@ -9,6 +9,7 @@ const MiniPass = require('minipass')
 
 const makeTar = require('./make-tar.js')
 const Header = require('../lib/header.js')
+const Pax = require('../lib/pax.js')
 const z = require('minizlib')
 const fs = require('fs')
 const path = require('path')
@@ -2641,9 +2642,12 @@ t.test('do not follow symlinks through backslash-named dirs on posix', {
 }, t => {
   const dir = path.resolve(unpackdir, 'backslash-dircache-poison')
   t.teardown(() => rimraf.sync(dir))
+  // The link target has to stay inside cwd, because a linkpath that walks
+  // out of the extraction target with '..' is refused outright, and the
+  // symlink would never be created at all.
   const data = makeTar([
     // a directory whose name contains a backslash, which then gets
-    // clobbered by a symlink pointing outside of the cwd
+    // clobbered by a symlink pointing somewhere else
     {
       path: 'x\\y',
       type: 'Directory',
@@ -2651,7 +2655,7 @@ t.test('do not follow symlinks through backslash-named dirs on posix', {
     {
       path: 'x\\y',
       type: 'SymbolicLink',
-      linkpath: '../outside',
+      linkpath: './elsewhere',
     },
     {
       path: 'x\\y/z',
@@ -2664,7 +2668,7 @@ t.test('do not follow symlinks through backslash-named dirs on posix', {
     {
       path: 'a\\b',
       type: 'SymbolicLink',
-      linkpath: '../outside',
+      linkpath: './elsewhere',
     },
     {
       path: 'a\\b/c',
@@ -2678,8 +2682,8 @@ t.test('do not follow symlinks through backslash-named dirs on posix', {
 
   const check = (t, base, warnings) => {
     const cwd = base + '/cwd'
-    t.strictSame(fs.readdirSync(base + '/outside'), [],
-      'nothing written outside of cwd')
+    t.strictSame(fs.readdirSync(cwd + '/elsewhere'), [],
+      'nothing written through the symlink')
     t.equal(fs.lstatSync(cwd + '/x\\y').isSymbolicLink(), true)
     t.equal(fs.lstatSync(cwd + '/a\\b').isSymbolicLink(), true)
     t.throws(() => fs.statSync(cwd + '/x'), { code: 'ENOENT' },
@@ -2696,8 +2700,7 @@ t.test('do not follow symlinks through backslash-named dirs on posix', {
 
   const setup = base => {
     rimraf.sync(base)
-    mkdirp.sync(base + '/cwd')
-    mkdirp.sync(base + '/outside')
+    mkdirp.sync(base + '/cwd/elsewhere')
   }
 
   t.test('async', t => {
@@ -2812,6 +2815,9 @@ t.test('treat backslash as a path separator on windows', {
 
   const dir = path.resolve(unpackdir, 'win32-backslash')
   t.teardown(() => rimraf.sync(dir))
+  // The link target has to stay inside cwd, because a linkpath that walks
+  // out of the extraction target with '..' is refused outright, and the
+  // symlink would never be created at all.
   const data = makeTar([
     {
       path: 'x/y',
@@ -2820,7 +2826,7 @@ t.test('treat backslash as a path separator on windows', {
     {
       path: 'x\\y',
       type: 'SymbolicLink',
-      linkpath: '..\\..\\outside',
+      linkpath: '..\\elsewhere',
     },
     {
       path: 'x\\y\\z',
@@ -2834,11 +2840,11 @@ t.test('treat backslash as a path separator on windows', {
 
   const check = (t, base, warnings) => {
     const cwd = base + '/cwd'
-    t.strictSame(fs.readdirSync(base + '/outside'), [],
-      'nothing written outside of cwd')
+    t.strictSame(fs.readdirSync(cwd + '/elsewhere'), [],
+      'nothing written through the symlink')
     t.equal(fs.lstatSync(cwd + '/x/y').isSymbolicLink(), true,
       'x\\y symlink replaced the x/y directory')
-    t.equal(fs.readlinkSync(cwd + '/x/y'), '../../outside',
+    t.equal(fs.readlinkSync(cwd + '/x/y'), '../elsewhere',
       'linkpath normalized')
     t.throws(() => fs.lstatSync(cwd + '/x\\y'), { code: 'ENOENT' })
     t.throws(() => fs.lstatSync(cwd + '/x\\y\\z'), { code: 'ENOENT' })
@@ -2850,8 +2856,7 @@ t.test('treat backslash as a path separator on windows', {
 
   const setup = base => {
     rimraf.sync(base)
-    mkdirp.sync(base + '/cwd')
-    mkdirp.sync(base + '/outside')
+    mkdirp.sync(base + '/cwd/elsewhere')
   }
 
   t.test('async', t => {
@@ -3098,18 +3103,20 @@ t.test('dircache prune all on windows when symlink encountered', t => {
 // the other name.  If that name's dirCache entry survives the symlink, the
 // symlink check in mkdir is skipped, and the file lands wherever the symlink
 // points.
+// The symlink points at a directory inside cwd, because a linkpath that
+// walks out of the extraction target with '..' is refused outright, and the
+// symlink would never be created at all.
 const dirCacheEscape = (t, dir, data, linkName) => {
   t.teardown(() => rimraf.sync(dir))
 
   const setup = base => {
     rimraf.sync(base)
-    mkdirp.sync(base + '/cwd')
-    mkdirp.sync(base + '/outside')
+    mkdirp.sync(base + '/cwd/elsewhere')
   }
 
   const check = (t, base, warnings) => {
-    t.strictSame(fs.readdirSync(base + '/outside'), [],
-      'nothing written outside of cwd')
+    t.strictSame(fs.readdirSync(base + '/cwd/elsewhere'), [],
+      'nothing written through the symlink')
     t.equal(fs.lstatSync(base + '/cwd/' + linkName).isSymbolicLink(), true,
       'symlink replaced the directory')
     t.strictSame(warnings, [
@@ -3159,7 +3166,7 @@ t.test('no extracting through symlink at a unicode-equivalent dir name', {
     {
       type: 'SymbolicLink',
       path: cafeNFC,
-      linkpath: '../outside',
+      linkpath: './elsewhere',
     },
     {
       type: 'File',
@@ -3191,7 +3198,7 @@ t.test('no extracting through symlink at an 8.3 short dir name', {
     {
       type: 'SymbolicLink',
       path: 'LongDirName',
-      linkpath: '../outside',
+      linkpath: './elsewhere',
     },
     {
       type: 'File',
@@ -3618,6 +3625,259 @@ t.test('maxDepth option on a shallow archive', t => {
 
     t.end()
   }))
+
+  t.end()
+})
+
+// GHSA-8qq5-rm4j-mr97: only entry.path used to be checked for '..' and for
+// an absolute root.  The linkpath of a link entry lands on the file system
+// just the same: a hard link's linkpath is resolved with
+// path.resolve(cwd, linkpath), which ignores cwd entirely when the linkpath
+// is absolute, and a symbolic link's linkpath is handed to fs.symlink()
+// verbatim, so either one could be pointed at anywhere on the system.
+t.test('GHSA-8qq5-rm4j-mr97 linkpath sanitization', {
+  skip: process.platform === 'win32' && 'symlinks not fully supported',
+}, t => {
+  const dir = path.resolve(unpackdir, 'linkpath-abs')
+  const secret = path.resolve(dir, 'secret.txt')
+  const SECRET = 'ORIGINAL DATA'
+  const targetSym = '/some/absolute/path'
+  t.teardown(() => rimraf.sync(dir))
+
+  // the absolute linkpath goes in a pax header as well, so that it is not
+  // truncated to 100 bytes when the test runs in a deeply nested dir.
+  const data = makeTar([
+    new Pax({ path: 'exploit_hard', linkpath: secret }).encode(),
+    {
+      path: 'exploit_hard',
+      type: 'Link',
+      size: 0,
+      linkpath: secret,
+    },
+    {
+      path: 'exploit_sym',
+      type: 'SymbolicLink',
+      size: 0,
+      linkpath: targetSym,
+    },
+    '',
+    '',
+  ])
+
+  const setup = leg => {
+    const cwd = path.resolve(dir, leg)
+    rimraf.sync(cwd)
+    mkdirp.sync(cwd)
+    fs.writeFileSync(secret, SECRET)
+    return cwd
+  }
+
+  const check = (t, cwd, warnings) => {
+    // the root came off the absolute hard link target, so it can only ever
+    // resolve inside cwd, where there is nothing to link to.
+    t.throws(() => fs.lstatSync(cwd + '/exploit_hard'), { code: 'ENOENT' },
+      'no hard link made to the absolute path outside cwd')
+    // writing where the hard link would have been must not reach the file
+    // that it was aimed at.
+    fs.writeFileSync(cwd + '/exploit_hard', 'OVERWRITTEN')
+    t.equal(fs.readFileSync(secret, 'utf8'), SECRET,
+      'hardlink should not point to secret file')
+
+    t.equal(fs.lstatSync(cwd + '/exploit_sym').isSymbolicLink(), true,
+      'symlink with an absolute target is still created')
+    const target = fs.readlinkSync(cwd + '/exploit_sym')
+    t.notEqual(target, targetSym, 'symlink should not point to absolute path')
+    t.equal(target, 'some/absolute/path', 'symlink target is relativized')
+
+    t.strictSame(warnings.filter(w => w[0] === 'TAR_ENTRY_INFO'), [
+      ['TAR_ENTRY_INFO', 'stripping / from absolute linkpath', secret],
+      ['TAR_ENTRY_INFO', 'stripping / from absolute linkpath', targetSym],
+    ])
+    t.end()
+  }
+
+  t.test('async', t => {
+    const cwd = setup('async')
+    const warnings = []
+    new Unpack({
+      cwd,
+      preservePaths: false,
+      onwarn: (c, w, d) => warnings.push([c, w, d.linkpath]),
+    }).on('close', () => check(t, cwd, warnings)).end(data)
+  })
+
+  t.test('sync', t => {
+    const cwd = setup('sync')
+    const warnings = []
+    new UnpackSync({
+      cwd,
+      preservePaths: false,
+      onwarn: (c, w, d) => warnings.push([c, w, d.linkpath]),
+    }).end(data)
+    check(t, cwd, warnings)
+  })
+
+  t.end()
+})
+
+t.test('linkpath may not use .. to escape the extraction directory', {
+  skip: process.platform === 'win32' && 'symlinks not fully supported',
+}, t => {
+  // a hard link is resolved relative to cwd, so its target may never use
+  // '..' at all.  A symbolic link is resolved relative to the dir it is in,
+  // so a relative target like '../foo/file.txt' is fine, as long as it does
+  // not lead out of cwd.  A drive-relative target like 'c:../x' has no '..'
+  // part until its 'c:' root is stripped off, and must not get past either.
+  const dir = path.resolve(unpackdir, 'linkpath-dots')
+  const secret = path.resolve(dir, 'secret.txt')
+  const SECRET = 'ORIGINAL DATA'
+  t.teardown(() => rimraf.sync(dir))
+
+  const data = makeTar([
+    {
+      path: 'hard_dotdot',
+      type: 'Link',
+      linkpath: '../secret.txt',
+    },
+    {
+      path: 'hard_drive',
+      type: 'Link',
+      linkpath: 'c:../secret.txt',
+    },
+    {
+      path: 'sym_parent',
+      type: 'SymbolicLink',
+      linkpath: '..',
+    },
+    {
+      path: 'sym_escape',
+      type: 'SymbolicLink',
+      linkpath: '../../escape',
+    },
+    {
+      path: 'sym_drive',
+      type: 'SymbolicLink',
+      linkpath: 'c:../escape',
+    },
+    {
+      path: 'foo/file.txt',
+      type: 'File',
+      size: 'hello world'.length,
+    },
+    'hello world',
+    {
+      path: 'bar/link.txt',
+      type: 'SymbolicLink',
+      linkpath: '../foo/file.txt',
+    },
+    {
+      path: 'bar/badlink.txt',
+      type: 'SymbolicLink',
+      linkpath: '../../oh/no',
+    },
+    {
+      path: 'a/link',
+      type: 'SymbolicLink',
+      linkpath: '/../a/target',
+    },
+    '',
+    '',
+  ])
+
+  const setup = leg => {
+    const cwd = path.resolve(dir, leg)
+    rimraf.sync(cwd)
+    mkdirp.sync(cwd)
+    fs.writeFileSync(secret, SECRET)
+    return cwd
+  }
+
+  // pick out only the messages the linkpath sanitizer itself emits
+  const sanitized = warnings => warnings.filter(w =>
+    /^(linkpath |stripping .* from absolute linkpath$)/.test(w[1]))
+
+  const check = (t, cwd, warnings) => {
+    t.throws(() => fs.lstatSync(cwd + '/hard_dotdot'), { code: 'ENOENT' },
+      'no hard link made to the ".." target outside cwd')
+    t.throws(() => fs.lstatSync(cwd + '/hard_drive'), { code: 'ENOENT' },
+      'no hard link made to the drive-relative target outside cwd')
+    fs.writeFileSync(cwd + '/hard_dotdot', 'OVERWRITTEN')
+    fs.writeFileSync(cwd + '/hard_drive', 'OVERWRITTEN')
+    t.equal(fs.readFileSync(secret, 'utf8'), SECRET,
+      'the file outside the extraction target is not overwritten')
+
+    t.throws(() => fs.lstatSync(cwd + '/sym_parent'), { code: 'ENOENT' },
+      'no symlink made to the parent of cwd')
+    t.throws(() => fs.lstatSync(cwd + '/sym_escape'), { code: 'ENOENT' },
+      'no symlink made to a target outside cwd')
+    t.throws(() => fs.lstatSync(cwd + '/sym_drive'), { code: 'ENOENT' },
+      'no symlink made to a drive-relative target outside cwd')
+    t.throws(() => fs.lstatSync(cwd + '/bar/badlink.txt'), { code: 'ENOENT' },
+      'no symlink made to a target outside cwd from a subdir')
+
+    t.equal(fs.lstatSync(cwd + '/bar/link.txt').isSymbolicLink(), true,
+      'valid relative symlink with .. is extracted')
+    t.equal(fs.readlinkSync(cwd + '/bar/link.txt'), '../foo/file.txt')
+    t.equal(fs.readFileSync(cwd + '/bar/link.txt', 'utf8'), 'hello world')
+
+    t.equal(fs.readlinkSync(cwd + '/a/link'), '../a/target',
+      'absolute symlink with .. has its root stripped')
+
+    t.strictSame(sanitized(warnings), [
+      ['TAR_ENTRY_ERROR', 'linkpath contains \'..\'', '../secret.txt'],
+      ['TAR_ENTRY_ERROR', 'linkpath escapes extraction directory',
+        'c:../secret.txt'],
+      ['TAR_ENTRY_ERROR', 'linkpath escapes extraction directory', '..'],
+      ['TAR_ENTRY_ERROR', 'linkpath escapes extraction directory',
+        '../../escape'],
+      ['TAR_ENTRY_ERROR', 'linkpath escapes extraction directory',
+        'c:../escape'],
+      ['TAR_ENTRY_ERROR', 'linkpath escapes extraction directory',
+        '../../oh/no'],
+      ['TAR_ENTRY_INFO', 'stripping / from absolute linkpath',
+        '/../a/target'],
+    ], 'each unsafe linkpath is warned about')
+    t.end()
+  }
+
+  t.test('async', t => {
+    const cwd = setup('async')
+    const warnings = []
+    new Unpack({
+      cwd,
+      onwarn: (c, w, d) => warnings.push([c, w, d.linkpath]),
+    }).on('close', () => check(t, cwd, warnings)).end(data)
+  })
+
+  t.test('sync', t => {
+    const cwd = setup('sync')
+    const warnings = []
+    new UnpackSync({
+      cwd,
+      onwarn: (c, w, d) => warnings.push([c, w, d.linkpath]),
+    }).end(data)
+    check(t, cwd, warnings)
+  })
+
+  t.test('preservePaths leaves the linkpath alone', t => {
+    // opting out has to keep working: with preservePaths the linkpath is
+    // used exactly as the archive spelled it
+    const cwd = setup('preserve')
+    const warnings = []
+    new UnpackSync({
+      cwd,
+      preservePaths: true,
+      onwarn: (c, w, d) => warnings.push([c, w, d.linkpath]),
+    }).end(data)
+    t.equal(fs.readlinkSync(cwd + '/sym_escape'), '../../escape',
+      'the ".." symbolic link target is preserved')
+    t.equal(fs.readlinkSync(cwd + '/sym_drive'), 'c:../escape',
+      'the drive-relative symbolic link target is preserved')
+    t.equal(fs.readlinkSync(cwd + '/a/link'), '/../a/target',
+      'the absolute symbolic link target is preserved')
+    t.strictSame(sanitized(warnings), [], 'no linkpath warnings')
+    t.end()
+  })
 
   t.end()
 })
