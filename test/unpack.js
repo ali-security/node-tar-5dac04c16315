@@ -3665,12 +3665,90 @@ t.test('GHSA-8qq5-rm4j-mr97 linkpath sanitization', {
     '',
   ])
 
+  // CVE-2026-31802: Windows drive-relative path with multiple dotdot that
+  // escapes.  '\' is a separator on windows but an ordinary character on
+  // posix, so 'c:..\..\..\..\foo\bar' reads as one harmless name in 'a'
+  // until its 'c:' root is stripped and the backslashes are taken to be the
+  // separators they are, and then it walks right out of the extraction
+  // target.  The target has to stay inside cwd whichever way it is read.
+  const escapeExploitTar = makeTar([
+    {
+      path: 'a/winrootdotsescapelink',
+      type: 'SymbolicLink',
+      linkpath: 'c:..\\..\\..\\..\\foo\\bar',
+    },
+    // lands exactly on the parent of cwd
+    {
+      path: 'a/winrootparentlink',
+      type: 'SymbolicLink',
+      linkpath: 'c:..\\..',
+    },
+    // the same escape with no root at all, only windows separators
+    {
+      path: 'a/b/backslashescapelink',
+      type: 'SymbolicLink',
+      linkpath: '..\\..\\..\\foo\\bar',
+    },
+    // with '\' read as '/' this stays in cwd, but on posix 'x\y' is a single
+    // name, so the '../..' after it still leads out of cwd
+    {
+      path: 'mixedseparatorlink',
+      type: 'SymbolicLink',
+      linkpath: 'x\\y/../..',
+    },
+    // backslash targets that do stay inside cwd are still made
+    {
+      path: 'a/winrootinsidelink',
+      type: 'SymbolicLink',
+      linkpath: 'c:x\\..\\y',
+    },
+    {
+      path: 'a/b/backslashinsidelink',
+      type: 'SymbolicLink',
+      linkpath: '..\\..\\y',
+    },
+    '',
+    '',
+  ])
+
   const setup = leg => {
     const cwd = path.resolve(dir, leg)
     rimraf.sync(cwd)
     mkdirp.sync(cwd)
     fs.writeFileSync(secret, SECRET)
     return cwd
+  }
+
+  const escapeCheck = (t, cwd, warnings) => {
+    t.throws(
+      () => fs.lstatSync(path.resolve(cwd, 'a/winrootdotsescapelink')),
+      { code: 'ENOENT' },
+      'escaping symlink is not created',
+    )
+    t.throws(() => fs.lstatSync(path.resolve(cwd, 'a/winrootparentlink')),
+      { code: 'ENOENT' }, 'symlink to the parent of cwd is not created')
+    t.throws(() => fs.lstatSync(path.resolve(cwd, 'a/b/backslashescapelink')),
+      { code: 'ENOENT' }, 'rootless backslash escape is not created')
+    t.throws(() => fs.lstatSync(path.resolve(cwd, 'mixedseparatorlink')),
+      { code: 'ENOENT' }, 'posix reading of the target is still checked')
+
+    t.equal(fs.readlinkSync(path.resolve(cwd, 'a/winrootinsidelink')),
+      'x\\..\\y', 'drive-relative backslash target inside cwd is still made')
+    t.equal(fs.readlinkSync(path.resolve(cwd, 'a/b/backslashinsidelink')),
+      '..\\..\\y', 'backslash target inside cwd is still made')
+
+    t.strictSame(warnings, [
+      ['TAR_ENTRY_ERROR', 'linkpath escapes extraction directory',
+        'c:..\\..\\..\\..\\foo\\bar'],
+      ['TAR_ENTRY_ERROR', 'linkpath escapes extraction directory',
+        'c:..\\..'],
+      ['TAR_ENTRY_ERROR', 'linkpath escapes extraction directory',
+        '..\\..\\..\\foo\\bar'],
+      ['TAR_ENTRY_ERROR', 'linkpath escapes extraction directory',
+        'x\\y/../..'],
+      ['TAR_ENTRY_INFO', 'stripping c: from absolute linkpath', 'c:x\\..\\y'],
+    ], 'each escaping linkpath is refused')
+    t.end()
   }
 
   const check = (t, cwd, warnings) => {
@@ -3707,6 +3785,18 @@ t.test('GHSA-8qq5-rm4j-mr97 linkpath sanitization', {
     }).on('close', () => check(t, cwd, warnings)).end(data)
   })
 
+  // CVE-2026-31802: escaping symlink after root strip should be rejected
+  t.test('async escape', t => {
+    const escapeOut = setup('async_escape')
+    const warnings = []
+    new Unpack({
+      cwd: escapeOut,
+      preservePaths: false,
+      onwarn: (c, w, d) => warnings.push([c, w, d.linkpath]),
+    }).on('end', () => escapeCheck(t, escapeOut, warnings))
+      .end(escapeExploitTar)
+  })
+
   t.test('sync', t => {
     const cwd = setup('sync')
     const warnings = []
@@ -3716,6 +3806,67 @@ t.test('GHSA-8qq5-rm4j-mr97 linkpath sanitization', {
       onwarn: (c, w, d) => warnings.push([c, w, d.linkpath]),
     }).end(data)
     check(t, cwd, warnings)
+  })
+
+  // CVE-2026-31802: escaping symlink after root strip should be rejected
+  t.test('sync escape', t => {
+    const escapeOut = setup('sync_escape')
+    const warnings = []
+    new UnpackSync({
+      cwd: escapeOut,
+      preservePaths: false,
+      onwarn: (c, w, d) => warnings.push([c, w, d.linkpath]),
+    }).end(escapeExploitTar)
+    escapeCheck(t, escapeOut, warnings)
+  })
+
+  // on windows, where '\' really is a separator, the escaping drive-relative
+  // target is refused as well
+  t.test('win32 escape', t => {
+    const WinUnpack = loadWinUnpack()
+    const winData = makeTar([
+      {
+        path: 'a/winrootdotsescapelink',
+        type: 'SymbolicLink',
+        linkpath: 'c:..\\..\\..\\..\\foo\\bar',
+      },
+      '',
+      '',
+    ])
+
+    const winCheck = (t, cwd, warnings) => {
+      t.throws(
+        () => fs.lstatSync(path.resolve(cwd, 'a/winrootdotsescapelink')),
+        { code: 'ENOENT' },
+        'escaping symlink is not created',
+      )
+      t.strictSame(warnings, [
+        ['TAR_ENTRY_ERROR', 'linkpath escapes extraction directory',
+          'c:../../../../foo/bar'],
+      ], 'escaping linkpath is refused')
+      t.end()
+    }
+
+    t.test('async', t => {
+      const cwd = setup('win32_async_escape')
+      const warnings = []
+      new WinUnpack({
+        cwd,
+        onwarn: (c, w, d) => warnings.push([c, w, d.linkpath]),
+      }).on('close', () => winCheck(t, cwd, warnings)).end(winData)
+    })
+
+    t.test('sync', t => {
+      const cwd = setup('win32_sync_escape')
+      const warnings = []
+      new WinUnpack.Sync({
+        cwd,
+        onwarn: (c, w, d) => warnings.push([c, w, d.linkpath]),
+      }).end(winData)
+      winCheck(t, cwd, warnings)
+    })
+
+    t.end()
   })
 
   t.end()
