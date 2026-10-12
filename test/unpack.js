@@ -21,6 +21,7 @@ const rimraf = require('rimraf')
 const mkdirp = require('mkdirp')
 const mutateFS = require('mutate-fs')
 const eos = require('end-of-stream')
+const ReadEntry = require('../lib/read-entry.js')
 
 t.teardown(_ => rimraf.sync(unpackdir))
 
@@ -3448,6 +3449,175 @@ t.test('drive-relative paths do not escape the extraction target', t => {
     }).end(data)
     check(t, base, warnings)
   })
+
+  t.end()
+})
+
+t.test('excessively deep subfolder nesting', t => {
+  const tf = path.resolve(fixtures, 'excessively-deep.tar')
+  const data = fs.readFileSync(tf)
+  const dir = path.resolve(unpackdir, 'excessively-deep')
+  t.teardown(() => rimraf.sync(dir))
+
+  const warnings = []
+  const onwarn = (c, w, { entry, path, depth, maxDepth }) =>
+    warnings.push([c, w, { entry, path, depth, maxDepth }])
+
+  const testdir = leg => {
+    const cwd = path.resolve(dir, leg)
+    rimraf.sync(cwd)
+    mkdirp.sync(cwd)
+    return cwd
+  }
+
+  const check = (t, cwd, maxDepth = 1024) => {
+    t.match(warnings, [
+      ['TAR_ENTRY_ERROR',
+        'path excessively deep',
+        {
+          entry: ReadEntry,
+          path: /^\.(\/a){1024,}\/foo.txt$/,
+          depth: 222372,
+          maxDepth,
+        },
+      ],
+    ])
+    t.equal(warnings.length, 1, 'only the depth warning was raised')
+    t.strictSame(fs.readdirSync(cwd), [], 'nothing was extracted')
+    warnings.length = 0
+    t.end()
+  }
+
+  t.test('async', t => {
+    const cwd = testdir('async')
+    new Unpack({
+      cwd,
+      onwarn,
+    }).on('close', () => check(t, cwd)).end(data)
+  })
+
+  t.test('sync', t => {
+    const cwd = testdir('sync')
+    new UnpackSync({
+      cwd,
+      onwarn,
+    }).end(data)
+    check(t, cwd)
+  })
+
+  t.test('async set md', t => {
+    const cwd = testdir('async-md')
+    new Unpack({
+      cwd,
+      onwarn,
+      maxDepth: 64,
+    }).on('close', () => check(t, cwd, 64)).end(data)
+  })
+
+  t.test('sync set md', t => {
+    const cwd = testdir('sync-md')
+    new UnpackSync({
+      cwd,
+      onwarn,
+      maxDepth: 64,
+    }).end(data)
+    check(t, cwd, 64)
+  })
+
+  t.end()
+})
+
+t.test('maxDepth option on a shallow archive', t => {
+  const dir = path.resolve(unpackdir, 'max-depth')
+  t.teardown(() => rimraf.sync(dir))
+
+  // 6 path portions deep
+  const file = 'a/b/c/d/e/f.txt'
+  const data = makeTar([
+    {
+      path: file,
+      type: 'File',
+      size: 1,
+    },
+    'x',
+    '',
+    '',
+  ])
+
+  const cases = {
+    'deeper than maxDepth': {
+      opt: { maxDepth: 5 },
+      depth: 6,
+    },
+    'exactly at maxDepth': {
+      opt: { maxDepth: 6 },
+      extracted: file,
+    },
+    'depth is checked after strip': {
+      opt: { maxDepth: 5, strip: 1 },
+      extracted: 'b/c/d/e/f.txt',
+    },
+    'deeper than maxDepth after strip': {
+      opt: { maxDepth: 4, strip: 1 },
+      depth: 5,
+    },
+    'maxDepth Infinity removes the restriction': {
+      opt: { maxDepth: Infinity },
+      extracted: file,
+    },
+  }
+
+  const check = (t, cwd, warnings, c) => {
+    if (c.extracted) {
+      t.strictSame(warnings, [], 'no warnings')
+      t.equal(fs.readFileSync(path.resolve(cwd, c.extracted), 'utf8'), 'x',
+        'file extracted')
+    } else {
+      t.match(warnings, [
+        ['TAR_ENTRY_ERROR',
+          'path excessively deep',
+          {
+            entry: ReadEntry,
+            path: file,
+            depth: c.depth,
+            maxDepth: c.opt.maxDepth,
+          },
+        ],
+      ])
+      t.equal(warnings.length, 1, 'only the depth warning was raised')
+      t.strictSame(fs.readdirSync(cwd), [], 'nothing was extracted')
+    }
+    t.end()
+  }
+
+  Object.keys(cases).forEach((name, i) => t.test(name, t => {
+    const c = cases[name]
+
+    const setup = leg => {
+      const cwd = path.resolve(dir, i + '-' + leg)
+      rimraf.sync(cwd)
+      mkdirp.sync(cwd)
+      const warnings = []
+      const opt = Object.assign({
+        cwd,
+        onwarn: (code, msg, warning) => warnings.push([code, msg, warning]),
+      }, c.opt)
+      return { cwd, warnings, opt }
+    }
+
+    t.test('async', t => {
+      const { cwd, warnings, opt } = setup('async')
+      new Unpack(opt).on('close', () => check(t, cwd, warnings, c)).end(data)
+    })
+
+    t.test('sync', t => {
+      const { cwd, warnings, opt } = setup('sync')
+      new UnpackSync(opt).end(data)
+      check(t, cwd, warnings, c)
+    })
+
+    t.end()
+  }))
 
   t.end()
 })
