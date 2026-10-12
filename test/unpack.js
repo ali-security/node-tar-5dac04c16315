@@ -3881,3 +3881,347 @@ t.test('linkpath may not use .. to escape the extraction directory', {
 
   t.end()
 })
+
+// CVE-2026-26960: fs.link() and fs.symlink() resolve every directory
+// component of the target they are handed, so a symbolic link anywhere along
+// a link entry's linkpath makes the new link a live handle on a file outside
+// the extraction target -- even though the linkpath itself holds no '..' and
+// no absolute root for the linkpath sanitizer to catch, and even though the
+// entry's own path never leaves cwd.
+//
+// The chain here is spelled entirely with symbolic links the archive itself
+// creates, so a single tar file is the whole exploit: 'a/b/up' -> '../..'
+// points back at the top of the extraction target, so 'a/b/escape' -> 'up/..'
+// points at its *parent*.  Nothing about either linkpath looks like an escape,
+// because path.resolve() collapses 'up/..' lexically back to 'a/b' and never
+// asks the file system what 'up' really is.  Only walking the linkpath
+// component by component and refusing any symbolic link found along it closes
+// that off.  The symbolic links themselves are still created -- only linking
+// *through* one is refused.
+const SYMLINK_ERROR = 'TAR_SYMLINK_ERROR: Cannot extract through symbolic link'
+
+t.test('no linking through a symlink', {
+  skip: process.platform === 'win32' && 'symlinks not fully supported',
+}, t => {
+  const base = path.resolve(unpackdir, 'link-through-symlink')
+  const VICTIM = 'original content'
+  t.teardown(() => rimraf.sync(base))
+
+  // the extraction target is 'x', and the file the archive is really after
+  // sits beside it, one level above the extraction target
+  const setup = leg => {
+    const root = path.resolve(base, leg)
+    rimraf.sync(root)
+    mkdirp.sync(root + '/x')
+    fs.writeFileSync(root + '/exploited-file', VICTIM)
+    return root
+  }
+
+  const exploit = type => makeTar([
+    {
+      type: 'SymbolicLink',
+      path: 'a/b/up',
+      linkpath: '../..',
+      mode: 0o755,
+    },
+    {
+      type: 'SymbolicLink',
+      path: 'a/b/escape',
+      linkpath: 'up/..',
+      mode: 0o755,
+    },
+    {
+      type: type,
+      path: 'exploit',
+      linkpath: 'a/b/escape/exploited-file',
+      mode: 0o755,
+    },
+    '',
+    '',
+  ])
+
+  const check = (t, root) => {
+    const cwd = root + '/x'
+    t.equal(fs.lstatSync(cwd + '/a/b/up').isSymbolicLink(), true,
+      'the first symbolic link of the chain is still created')
+    t.equal(fs.lstatSync(cwd + '/a/b/escape').isSymbolicLink(), true,
+      'the second symbolic link of the chain is still created')
+    // the chain really does land outside the extraction target: ask the
+    // kernel, by writing through it.
+    fs.writeFileSync(cwd + '/a/b/escape/probe', 'x')
+    t.equal(fs.readFileSync(root + '/probe', 'utf8'), 'x',
+      'the symbolic link chain resolves outside the extraction target')
+
+    t.throws(() => fs.lstatSync(cwd + '/exploit'), { code: 'ENOENT' },
+      'no link made through the symbolic link')
+    // had the link been made, this write would have gone straight through it
+    // and landed on the file outside the extraction target
+    fs.writeFileSync(cwd + '/exploit', 'pwned')
+    t.equal(fs.readFileSync(root + '/exploited-file', 'utf8'), VICTIM,
+      'the file outside the extraction target is not written to')
+    t.end()
+  }
+
+  const types = ['Link', 'SymbolicLink']
+  types.forEach(type => {
+    t.test(type, t => {
+      const data = exploit(type)
+
+      t.test('async', t => {
+        const root = setup('async-' + type)
+        const warnings = []
+        new Unpack({
+          cwd: root + '/x',
+          onwarn: (c, w) => warnings.push([c, w]),
+        }).on('close', () => {
+          t.strictSame(warnings, [['TAR_ENTRY_ERROR', SYMLINK_ERROR]],
+            'refused because of the symbolic link')
+          check(t, root)
+        }).end(data)
+      })
+
+      t.test('sync', t => {
+        const root = setup('sync-' + type)
+        const warnings = []
+        new UnpackSync({
+          cwd: root + '/x',
+          onwarn: (c, w) => warnings.push([c, w]),
+        }).end(data)
+        t.strictSame(warnings, [['TAR_ENTRY_ERROR', SYMLINK_ERROR]],
+          'refused because of the symbolic link')
+        check(t, root)
+      })
+
+      t.test('async strict', t => {
+        const root = setup('async-strict-' + type)
+        const errors = []
+        new Unpack({ cwd: root + '/x', strict: true })
+          .on('error', er => errors.push([er.code, er.message]))
+          .on('close', () => {
+            t.strictSame(errors, [['TAR_ENTRY_ERROR', SYMLINK_ERROR]],
+              'strict mode raises the refusal as an error')
+            check(t, root)
+          }).end(data)
+      })
+
+      t.test('sync strict', t => {
+        const root = setup('sync-strict-' + type)
+        const u = new UnpackSync({ cwd: root + '/x', strict: true })
+        t.throws(() => u.end(data), {
+          code: 'TAR_ENTRY_ERROR',
+          message: SYMLINK_ERROR,
+        }, 'strict mode throws the refusal')
+        check(t, root)
+      })
+
+      t.end()
+    })
+  })
+
+  t.end()
+})
+
+// CVE-2026-26960: the same hazard with a single symbolic link that is already
+// sitting in the extraction target when the archive is unpacked -- left there
+// by an earlier archive, or by anything else on the system.  The archive is
+// then a one-entry file whose linkpath, 'x/victim.txt', holds no '..' and no
+// root at all, so there is nothing about it for the linkpath sanitizer to
+// object to; only walking it and finding that 'x' is a symbolic link does.
+t.test('no linking through a symlink already on disk', {
+  skip: process.platform === 'win32' && 'symlinks not fully supported',
+}, t => {
+  const base = path.resolve(unpackdir, 'link-through-planted-symlink')
+  const VICTIM = 'original content'
+  t.teardown(() => rimraf.sync(base))
+
+  // 'x' is a symbolic link inside the extraction target pointing at a
+  // directory outside of it
+  const setup = leg => {
+    const root = path.resolve(base, leg)
+    rimraf.sync(root)
+    mkdirp.sync(root + '/cwd')
+    mkdirp.sync(root + '/outside')
+    fs.writeFileSync(root + '/outside/victim.txt', VICTIM)
+    fs.symlinkSync(root + '/outside', root + '/cwd/x')
+    return root
+  }
+
+  const exploit = type => makeTar([
+    {
+      type: type,
+      path: 'exploit',
+      linkpath: 'x/victim.txt',
+      mode: 0o755,
+    },
+    '',
+    '',
+  ])
+
+  const check = (t, root, warnings) => {
+    const cwd = root + '/cwd'
+    t.strictSame(warnings, [['TAR_ENTRY_ERROR', SYMLINK_ERROR]],
+      'refused because of the symbolic link')
+    t.equal(fs.lstatSync(cwd + '/x').isSymbolicLink(), true,
+      'the symbolic link in the way is left alone')
+    t.throws(() => fs.lstatSync(cwd + '/exploit'), { code: 'ENOENT' },
+      'no link made through the symbolic link')
+    // had the link been made, this write would have gone straight through it
+    // and landed on the file outside the extraction target
+    fs.writeFileSync(cwd + '/exploit', 'pwned')
+    t.equal(fs.readFileSync(root + '/outside/victim.txt', 'utf8'), VICTIM,
+      'the file outside the extraction target is not written to')
+    t.end()
+  }
+
+  const types = ['Link', 'SymbolicLink']
+  types.forEach(type => {
+    t.test(type, t => {
+      const data = exploit(type)
+
+      t.test('async', t => {
+        const root = setup('async-' + type)
+        const warnings = []
+        new Unpack({
+          cwd: root + '/cwd',
+          onwarn: (c, w) => warnings.push([c, w]),
+        }).on('close', () => check(t, root, warnings)).end(data)
+      })
+
+      t.test('sync', t => {
+        const root = setup('sync-' + type)
+        const warnings = []
+        new UnpackSync({
+          cwd: root + '/cwd',
+          onwarn: (c, w) => warnings.push([c, w]),
+        }).end(data)
+        check(t, root, warnings)
+      })
+
+      t.test('preservePaths opts out', t => {
+        // preservePaths means "do exactly what the archive says", so the
+        // walk is skipped entirely and the link is made through the symlink
+        const checkMade = (t, root, warnings) => {
+          t.strictSame(warnings, [], 'no warnings')
+          t.equal(fs.readFileSync(root + '/cwd/exploit', 'utf8'), VICTIM,
+            'the link was made through the symbolic link')
+          t.end()
+        }
+
+        t.test('async', t => {
+          const root = setup('preserve-async-' + type)
+          const warnings = []
+          new Unpack({
+            cwd: root + '/cwd',
+            preservePaths: true,
+            onwarn: (c, w) => warnings.push([c, w]),
+          }).on('close', () => checkMade(t, root, warnings)).end(data)
+        })
+
+        t.test('sync', t => {
+          const root = setup('preserve-sync-' + type)
+          const warnings = []
+          new UnpackSync({
+            cwd: root + '/cwd',
+            preservePaths: true,
+            onwarn: (c, w) => warnings.push([c, w]),
+          }).end(data)
+          checkMade(t, root, warnings)
+        })
+
+        t.end()
+      })
+
+      t.end()
+    })
+  })
+
+  t.end()
+})
+
+// the walk must not get in the way of links that have no symbolic link along
+// their target: those are made as before, and a target that does not exist
+// yet is left for the link itself to deal with.
+t.test('links with no symlink in the way are still made', {
+  skip: process.platform === 'win32' && 'symlinks not fully supported',
+}, t => {
+  const base = path.resolve(unpackdir, 'link-no-symlink-in-the-way')
+  t.teardown(() => rimraf.sync(base))
+
+  const data = makeTar([
+    {
+      type: 'Directory',
+      path: 'real',
+    },
+    {
+      type: 'File',
+      path: 'real/file',
+      size: 'hello'.length,
+    },
+    'hello',
+    {
+      type: 'Link',
+      path: 'hard',
+      linkpath: 'real/file',
+    },
+    {
+      type: 'SymbolicLink',
+      path: 'real/sym',
+      linkpath: 'file',
+    },
+    {
+      type: 'SymbolicLink',
+      path: 'dangling',
+      linkpath: 'no/such/target',
+    },
+    {
+      type: 'Link',
+      path: 'hard-missing',
+      linkpath: 'no/such/target',
+    },
+    '',
+    '',
+  ])
+
+  const setup = leg => {
+    const cwd = path.resolve(base, leg)
+    rimraf.sync(cwd)
+    mkdirp.sync(cwd)
+    return cwd
+  }
+
+  const check = (t, cwd, warnings) => {
+    t.equal(fs.statSync(cwd + '/hard').ino, fs.statSync(cwd + '/real/file').ino,
+      'hard link made')
+    t.equal(fs.readlinkSync(cwd + '/real/sym'), 'file', 'symlink made')
+    t.equal(fs.readFileSync(cwd + '/real/sym', 'utf8'), 'hello')
+    t.equal(fs.readlinkSync(cwd + '/dangling'), 'no/such/target',
+      'symlink to a missing target made')
+    t.throws(() => fs.lstatSync(cwd + '/hard-missing'), { code: 'ENOENT' },
+      'hard link to a missing target fails')
+    t.equal(warnings.length, 1, 'only the missing hard link target warns')
+    t.match(warnings[0], ['TAR_ENTRY_ERROR', /ENOENT/],
+      'with the real errno from the link itself')
+    t.end()
+  }
+
+  t.test('async', t => {
+    const cwd = setup('async')
+    const warnings = []
+    new Unpack({
+      cwd,
+      onwarn: (c, w) => warnings.push([c, w]),
+    }).on('close', () => check(t, cwd, warnings)).end(data)
+  })
+
+  t.test('sync', t => {
+    const cwd = setup('sync')
+    const warnings = []
+    new UnpackSync({
+      cwd,
+      onwarn: (c, w) => warnings.push([c, w]),
+    }).end(data)
+    check(t, cwd, warnings)
+  })
+
+  t.end()
+})
