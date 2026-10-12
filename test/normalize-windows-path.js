@@ -22,6 +22,9 @@ t.test('posix', t => {
   const normPath = loadNormPath()
   t.equal(normPath('/some/path/back\\slashes'), '/some/path/back\\slashes')
   t.equal(normPath('c:\\foo\\bar'), 'c:\\foo\\bar')
+  t.equal(normPath(null), null, 'null passes through')
+  t.equal(normPath(undefined), undefined, 'undefined passes through')
+  t.equal(normPath(12345), '12345', 'numbers are coerced to strings')
   t.end()
 })
 
@@ -35,5 +38,7 @@ t.test('win32', t => {
   t.equal(normPath('c:\\foo\\bar'), 'c:/foo/bar')
   t.equal(normPath(null), null, 'null linkpath passes through')
   t.equal(normPath(''), '', 'empty string passes through')
+  t.equal(normPath(undefined), undefined, 'undefined passes through')
+  t.equal(normPath(12345), '12345', 'numbers are coerced to strings')
   t.end()
 })

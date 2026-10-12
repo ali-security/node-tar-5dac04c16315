@@ -332,3 +332,88 @@ t.test('no negative size', t => {
   })
   t.end()
 })
+
+t.test('string fields stay string', t => {
+  const parsed = Pax.parse(
+    '14 path=12345\n18 linkpath=54321\n13 WAT=12345\n15 ctime=12345\n',
+    null, false)
+  t.same(parsed, {
+    atime: null,
+    charset: null,
+    comment: null,
+    ctime: new Date('1970-01-01T03:25:45.000Z'),
+    gid: null,
+    gname: null,
+    linkpath: '54321',
+    mtime: null,
+    path: '12345',
+    size: null,
+    uid: null,
+    uname: null,
+    dev: null,
+    ino: null,
+    nlink: null,
+    global: false
+  })
+  t.equal(parsed.path, '12345', 'numeric-looking path is a string')
+  t.equal(parsed.linkpath, '54321', 'numeric-looking linkpath is a string')
+  t.type(parsed.ctime, Date)
+  t.notOk('WAT' in parsed, 'unknown keys are not kept')
+  t.end()
+})
+
+t.test('each key is coerced by its own type', t => {
+  const ex = Object.create(null)
+  const parsed = Pax.parse(
+    '14 path=12345\n' +
+    '18 linkpath=54321\n' +
+    '9 type=0\n' +
+    '14 charset=12\n' +
+    '14 comment=34\n' +
+    '12 gname=56\n' +
+    '12 uname=78\n' +
+    '11 atime=1\n' +
+    '11 mtime=2\n' +
+    '11 ctime=3\n' +
+    '12 size=100\n' +
+    '9 gid=20\n' +
+    '13 uid=24561\n' +
+    '18 SCHILY.dev=123\n' +
+    '18 SCHILY.ino=456\n' +
+    '18 SCHILY.nlink=1\n' +
+    '12 mode=420\n' +
+    '13 WAT=12345\n',
+    ex, false)
+
+  t.same(parsed, {
+    atime: new Date(1000),
+    charset: '12',
+    comment: '34',
+    ctime: new Date(3000),
+    gid: 20,
+    gname: '56',
+    linkpath: '54321',
+    mtime: new Date(2000),
+    path: '12345',
+    size: 100,
+    uid: 24561,
+    uname: '78',
+    dev: 123,
+    ino: 456,
+    nlink: 1,
+    global: false
+  })
+
+  // the raw parsed key/value set is merged onto the pending extended header
+  for (const k of ['path', 'linkpath', 'type', 'charset', 'comment',
+    'gname', 'uname'])
+    t.equal(typeof ex[k], 'string', k + ' is a string')
+  t.equal(ex.type, '0')
+  for (const k of ['atime', 'mtime', 'ctime'])
+    t.type(ex[k], Date, k + ' is a Date')
+  for (const k of ['size', 'gid', 'uid', 'dev', 'ino', 'nlink', 'mode'])
+    t.equal(typeof ex[k], 'number', k + ' is a number')
+  t.equal(ex.mode, 420)
+  t.notOk('WAT' in ex, 'unknown keys are dropped')
+  t.end()
+})

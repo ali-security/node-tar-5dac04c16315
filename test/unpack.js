@@ -4682,3 +4682,94 @@ t.test('pax path and linkpath are truncated at a NUL byte', {
 
   t.end()
 })
+
+// Helper for 'numeric pax/entry name discernment' test:
+// A PAX header entry with a numeric-looking path (e.g. "12345") must be
+// extracted as a file named "12345", not crash or skip, in strict and non-strict.
+const makePaxNameData = (paxName, entryName) => {
+  const paxHeader = new Pax({ path: paxName, size: '12345\n'.length }, false)
+  const paxData = paxHeader.encode()
+  return makeTar([
+    paxData,
+    {
+      type: 'File',
+      path: entryName,
+      mode: 0o755,
+      ctime: new Date('2000-01-01T00:00:00.000Z'),
+      mtime: new Date('2000-01-01T00:00:00.000Z'),
+      size: '12345\n'.length,
+    },
+    '12345\n',
+    '',
+    '',
+  ])
+}
+
+const numericPaxDir = leg => {
+  const cwd = path.resolve(unpackdir, 'numeric-pax-name', leg)
+  rimraf.sync(cwd)
+  mkdirp.sync(cwd)
+  return cwd
+}
+
+for (const strict of [true, false]) {
+  for (const paxName of ['12345', 'abcde']) {
+    for (const entryName of ['12345', 'abcde']) {
+      const label = `numeric pax/entry name discernment strict=${strict} paxName=${paxName} entryName=${entryName}`
+      const data = makePaxNameData(paxName, entryName)
+      const leg = `${strict}-${paxName}-${entryName}`
+
+      t.test(label + ' sync', t => {
+        const cwd = numericPaxDir(leg + '-sync')
+        new UnpackSync({ strict, cwd }).end(data)
+        t.equal(fs.readFileSync(cwd + '/' + paxName, 'utf8'), '12345\n')
+        t.end()
+      })
+
+      t.test(label + ' async', t => {
+        const cwd = numericPaxDir(leg + '-async')
+        new Unpack({ strict, cwd }).on('end', () => {
+          t.equal(fs.readFileSync(cwd + '/' + paxName, 'utf8'), '12345\n')
+          t.end()
+        }).end(data)
+      })
+    }
+  }
+}
+
+// a numeric-looking pax linkpath must stay the string it was written as
+t.test('numeric pax linkpath', {
+  skip: process.platform === 'win32' && 'symlinks not fully supported',
+}, t => {
+  const data = makeTar([
+    new Pax({ path: 'sym', linkpath: '12345' }).encode(),
+    {
+      path: 'abcde',
+      type: 'SymbolicLink',
+      linkpath: 'abcde',
+      size: 0,
+    },
+    '',
+    '',
+  ])
+
+  const check = (t, cwd) => {
+    t.equal(fs.readlinkSync(cwd + '/sym'), '12345')
+    t.end()
+  }
+
+  for (const strict of [true, false]) {
+    t.test(`strict=${strict} sync`, t => {
+      const cwd = numericPaxDir(`linkpath-${strict}-sync`)
+      new UnpackSync({ strict, cwd }).end(data)
+      check(t, cwd)
+    })
+
+    t.test(`strict=${strict} async`, t => {
+      const cwd = numericPaxDir(`linkpath-${strict}-async`)
+      new Unpack({ strict, cwd }).on('close', () => check(t, cwd)).end(data)
+    })
+  }
+
+  t.end()
+})
