@@ -1,6 +1,7 @@
 'use strict'
 const t = require('tap')
 const Header = require('../lib/header.js')
+const types = require('../lib/types.js')
 
 t.test('ustar format', t => {
   const buf = Buffer.from(
@@ -610,5 +611,131 @@ t.test('gnutar-generated 10gb file size', t => {
     '0000000000000000000000000000000000000000000000000000000000000000', 'hex')
   const h = new Header(b)
   t.equal(h.size, 1024 * 1024 * 1024 * 10, 'should be 10gb file')
+  t.end()
+})
+
+t.test('do not apply ex/gex to meta entries', t => {
+  // Per POSIX pax, a PAX extended header describes the *next file entry*,
+  // not intermediary extension headers (L/K/x/g). Applying pending PAX
+  // overrides (notably `size`) to an intervening L/K/x/g header
+  // desynchronizes the stream and enables file-smuggling attacks (CVE-2026-53655).
+  const normalEntryTypes = new Set([
+    'File',
+    'OldFile',
+    'Link',
+    'SymbolicLink',
+    'CharacterDevice',
+    'BlockDevice',
+    'Directory',
+    'FIFO',
+    'ContiguousFile',
+    'GNUDumpDir',
+  ])
+
+  for (const type of types.name.values()) {
+    const data = new Header({
+      path: 'x',
+      type,
+      size: 1,
+    })
+    data.encode()
+    const h = new Header(data.block, 0, {
+      size: 100,
+      dev: 5678,
+      ino: 9876,
+    })
+    if (normalEntryTypes.has(type)) {
+      if (h.type === 'Directory') {
+        t.equal(h.size, 0, 'Directories always size=0, no matter what')
+      } else {
+        t.equal(h.size, 100, `expect ${type} to respect extended header`)
+      }
+      t.equal(h.dev, 5678, `expect ${type} to respect extended header`)
+      t.equal(h.ino, 9876, `expect ${type} to respect extended header`)
+    } else {
+      t.equal(h.size, 1, `expect ${type} to ignore extended header`)
+      t.equal(h.dev, undefined, `expect ${type} to ignore extended header`)
+      t.equal(h.ino, undefined, `expect ${type} to ignore extended header`)
+    }
+  }
+
+  t.end()
+})
+
+t.test('do not apply any ex/gex field to meta entries', t => {
+  // Every field a pending extended header can override must be honored on a
+  // normal file system entry and ignored on an intermediary meta entry,
+  // whether it arrives via a local (ex) or a global (gex) extended header.
+  const normalEntryTypes = new Set([
+    'File',
+    'OldFile',
+    'Link',
+    'SymbolicLink',
+    'CharacterDevice',
+    'BlockDevice',
+    'Directory',
+    'FIFO',
+    'ContiguousFile',
+    'GNUDumpDir',
+  ])
+
+  const mtime = new Date('2016-04-01T22:00:00.000Z')
+  const ext = {
+    path: 'extended/path',
+    mode: 0o751,
+    uid: 1234,
+    gid: 4321,
+    size: 100,
+    mtime: mtime,
+    uname: 'ext-user',
+    gname: 'ext-group',
+    devmaj: 7,
+    devmin: 9,
+    dev: 5678,
+    ino: 9876,
+  }
+
+  for (const global of [false, true]) {
+    for (const type of types.name.values()) {
+      const data = new Header({
+        path: 'x',
+        type,
+        size: 1,
+      })
+      data.encode()
+      const h = global ? new Header(data.block, 0, undefined, ext)
+        : new Header(data.block, 0, ext)
+      const name = `${type} (${global ? 'global ' : ''}extended header)`
+      if (normalEntryTypes.has(type)) {
+        // a global extended header never sets the path
+        t.equal(h.path, global ? 'x' : 'extended/path', `${name} path`)
+        t.equal(h.mode, 0o751, `${name} mode`)
+        t.equal(h.uid, 1234, `${name} uid`)
+        t.equal(h.gid, 4321, `${name} gid`)
+        t.equal(h.size, h.type === 'Directory' ? 0 : 100, `${name} size`)
+        t.equal(h.mtime.getTime(), mtime.getTime(), `${name} mtime`)
+        t.equal(h.uname, 'ext-user', `${name} uname`)
+        t.equal(h.gname, 'ext-group', `${name} gname`)
+        t.equal(h.devmaj, 7, `${name} devmaj`)
+        t.equal(h.devmin, 9, `${name} devmin`)
+        t.equal(h.dev, 5678, `${name} dev`)
+        t.equal(h.ino, 9876, `${name} ino`)
+      } else {
+        t.equal(h.path, 'x', `${name} path ignored`)
+        t.equal(h.mode, null, `${name} mode ignored`)
+        t.equal(h.uid, null, `${name} uid ignored`)
+        t.equal(h.gid, null, `${name} gid ignored`)
+        t.equal(h.size, 1, `${name} size ignored`)
+        t.equal(h.mtime, null, `${name} mtime ignored`)
+        t.equal(h.uname, '', `${name} uname ignored`)
+        t.equal(h.gname, '', `${name} gname ignored`)
+        t.equal(h.devmaj, 0, `${name} devmaj ignored`)
+        t.equal(h.devmin, 0, `${name} devmin ignored`)
+        t.equal(h.dev, undefined, `${name} dev ignored`)
+        t.equal(h.ino, undefined, `${name} ino ignored`)
+      }
+    }
+  }
+
   t.end()
 })

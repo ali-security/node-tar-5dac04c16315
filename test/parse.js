@@ -9,6 +9,7 @@ const tardir = path.resolve(__dirname, 'fixtures/tars')
 const zlib = require('zlib')
 const MiniPass = require('minipass')
 const Header = require('../lib/header.js')
+const Pax = require('../lib/pax.js')
 const EE = require('events').EventEmitter
 
 t.test('fixture tests', t => {
@@ -686,4 +687,225 @@ t.test('warnings that are not so bad', t => {
     t.end()
   })
   p.end(data)
+})
+
+// CVE-2026-53655 - tar interpretation conflict / file smuggling.
+//
+// A PAX extended header describes the *next file entry*, not the extension
+// headers that may sit between it and that entry.  Honoring its fields on an
+// intervening x/g/L/K block makes this parser see a different archive than
+// gnu tar, bsdtar, libarchive and python's tarfile do.
+t.test('CVE-2026-53655', t => {
+  const parseEntries = (data, opt, cb) => {
+    const entries = []
+    const ignored = []
+    const warnings = []
+    const p = new Parse(Object.assign({
+      onwarn: (code, msg) => warnings.push([code, msg]),
+      onentry: entry => {
+        entries.push([entry.path, entry.size, entry.linkpath])
+        entry.resume()
+      },
+    }, opt))
+    p.on('ignoredEntry', entry => ignored.push(entry.path))
+    p.on('end', _ => cb(entries, ignored, warnings))
+    p.end(data)
+  }
+
+  t.test('pax size does not resize a gnu long-path header', t => {
+    // x(size=1024) -> L -> file.  A vulnerable parser stretches the
+    // long-path block from 1 body block to 2, swallowing the file header
+    // that follows it, so the file every other tar reports is smuggled past.
+    const paxBody = new Pax({ size: 1024 }).encodeBody()
+    const data = makeTar([
+      {
+        path: 'PaxHeader/innocent.txt',
+        type: 'ExtendedHeader',
+        size: paxBody.length,
+      },
+      paxBody,
+      {
+        path: '././@LongLink',
+        type: 'NextFileHasLongPath',
+        size: 512,
+      },
+      'smuggled/evil.txt',
+      {
+        path: 'innocent.txt',
+        type: 'File',
+        size: 1024,
+      },
+      new Array(513).join('a'),
+      new Array(513).join('b'),
+      '',
+      '',
+    ])
+
+    parseEntries(data, {}, (entries, ignored, warnings) => {
+      t.same(warnings, [], 'stream stayed in sync')
+      t.same(ignored, [], 'nothing skipped')
+      t.same(entries, [['smuggled/evil.txt', 1024, '']],
+        'long path applies to the file, not to the long-path header')
+      t.end()
+    })
+  })
+
+  t.test('pax size does not hide a long path behind maxMetaEntrySize', t => {
+    // x(size=1200) -> L -> file, with maxMetaEntrySize=600.  A vulnerable
+    // parser gives the long-path entry the pax size, decides it is too big to
+    // read, and drops the long path - reporting innocent.txt for an entry
+    // that every other tar extracts as smuggled/evil.txt.
+    const paxBody = new Pax({ size: 1200 }).encodeBody()
+    const data = makeTar([
+      {
+        path: 'PaxHeader/innocent.txt',
+        type: 'ExtendedHeader',
+        size: paxBody.length,
+      },
+      paxBody,
+      {
+        path: '././@LongLink',
+        type: 'NextFileHasLongPath',
+        size: 512,
+      },
+      'smuggled/evil.txt',
+      {
+        path: 'innocent.txt',
+        type: 'File',
+        size: 1200,
+      },
+      new Array(513).join('a'),
+      new Array(513).join('b'),
+      new Array(513).join('c'),
+      '',
+      '',
+    ])
+
+    parseEntries(data, { maxMetaEntrySize: 600 }, (entries, ignored, warnings) => {
+      t.same(warnings, [], 'stream stayed in sync')
+      t.same(ignored, [], 'the long-path header is read, not skipped')
+      t.same(entries, [['smuggled/evil.txt', 1200, '']],
+        'long path applies to the file')
+      t.end()
+    })
+  })
+
+  t.test('pax size does not hide a long linkpath behind maxMetaEntrySize', t => {
+    // x(size=1200) -> K -> symlink, with maxMetaEntrySize=600.  A vulnerable
+    // parser either desyncs on the long-link block, or skips it as too big
+    // and reports the decoy linkpath instead of the one every other tar uses.
+    const paxBody = new Pax({ size: 1200 }).encodeBody()
+    const data = makeTar([
+      {
+        path: 'PaxHeader/link',
+        type: 'ExtendedHeader',
+        size: paxBody.length,
+      },
+      paxBody,
+      {
+        path: '././@LongLink',
+        type: 'NextFileHasLongLinkpath',
+        size: 512,
+      },
+      'smuggled/target',
+      {
+        path: 'link',
+        type: 'SymbolicLink',
+        linkpath: 'harmless',
+        size: 1200,
+      },
+      new Array(513).join('a'),
+      new Array(513).join('b'),
+      new Array(513).join('c'),
+      '',
+      '',
+    ])
+
+    parseEntries(data, { maxMetaEntrySize: 600 }, (entries, ignored, warnings) => {
+      t.same(warnings, [], 'stream stayed in sync')
+      t.same(ignored, [], 'the long-link header is read, not skipped')
+      t.same(entries, [['link', 1200, 'smuggled/target']],
+        'long linkpath applies to the symlink')
+      t.end()
+    })
+  })
+
+  t.test('global pax size does not resize a gnu long-path header', t => {
+    // Same primitive through a *global* extended header, which is never
+    // cleared: g(size=1024) -> L -> file.  One block at the front of the
+    // archive is enough to stretch every long-path header that follows it.
+    const paxBody = new Pax({ size: 1024 }, true).encodeBody()
+    const data = makeTar([
+      {
+        path: 'PaxHeader/global',
+        type: 'GlobalExtendedHeader',
+        size: paxBody.length,
+      },
+      paxBody,
+      {
+        path: '././@LongLink',
+        type: 'NextFileHasLongPath',
+        size: 512,
+      },
+      'smuggled/evil.txt',
+      {
+        path: 'innocent.txt',
+        type: 'File',
+        size: 1024,
+      },
+      new Array(513).join('a'),
+      new Array(513).join('b'),
+      '',
+      '',
+    ])
+
+    parseEntries(data, {}, (entries, ignored, warnings) => {
+      t.same(warnings, [], 'stream stayed in sync')
+      t.same(ignored, [], 'nothing skipped')
+      t.same(entries, [['smuggled/evil.txt', 1024, '']],
+        'global header applies to the file, not to the long-path header')
+      t.end()
+    })
+  })
+
+  t.test('pax size does not resize a following pax header', t => {
+    // x(size=1024) -> x(path=smuggled/evil.txt) -> file.  The second
+    // extended header must be read with its own size, so its records
+    // (here the path) still apply to the file that follows.
+    const paxBody = new Pax({ size: 1024 }).encodeBody()
+    const paxBody2 = new Pax({ path: 'smuggled/evil.txt' }).encodeBody()
+    const data = makeTar([
+      {
+        path: 'PaxHeader/innocent.txt',
+        type: 'ExtendedHeader',
+        size: paxBody.length,
+      },
+      paxBody,
+      {
+        path: 'PaxHeader/innocent.txt',
+        type: 'ExtendedHeader',
+        size: paxBody2.length,
+      },
+      paxBody2,
+      {
+        path: 'innocent.txt',
+        type: 'File',
+        size: 1024,
+      },
+      new Array(513).join('a'),
+      new Array(513).join('b'),
+      '',
+      '',
+    ])
+
+    parseEntries(data, {}, (entries, ignored, warnings) => {
+      t.same(warnings, [], 'stream stayed in sync')
+      t.same(ignored, [], 'nothing skipped')
+      t.same(entries, [['smuggled/evil.txt', 1024, '']],
+        'both extended headers apply to the file')
+      t.end()
+    })
+  })
+
+  t.end()
 })

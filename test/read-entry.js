@@ -222,3 +222,70 @@ t.test('entry without mode', t => {
 
   t.end()
 })
+
+t.test('meta entries ignore extended headers', t => {
+  // CVE-2026-53655: a pending extended header describes the next *file*
+  // entry.  Its fields (notably size) must never be applied to the
+  // intermediary x/g/L/K entries that may sit between it and that file.
+  const ex = {
+    path: 'smuggled/evil.txt',
+    linkpath: 'smuggled/target',
+    size: 2 * 1024 * 1024,
+    uid: 1234,
+    x: 'y'
+  }
+  const gex = { size: 3 * 1024 * 1024, gid: 4321, z: 'w' }
+  const metaTypes = [
+    'NextFileHasLongLinkpath',
+    'NextFileHasLongPath',
+    'OldGnuLongPath',
+    'GlobalExtendedHeader',
+    'ExtendedHeader',
+    'OldExtendedHeader'
+  ]
+
+  metaTypes.forEach(type => {
+    const h = new Header({
+      path: '././@LongLink',
+      uid: 24561,
+      gid: 20,
+      size: 23,
+      type: type
+    })
+    h.encode()
+    const entry = new ReadEntry(new Header(h.block, 0, ex, gex), ex, gex)
+    t.match(entry, {
+      extended: ex,
+      globalExtended: gex,
+      meta: true,
+      type: type,
+      path: '././@LongLink',
+      size: 23,
+      remain: 23,
+      blockRemain: 512,
+      uid: 24561,
+      gid: 20
+    }, type + ' keeps its own header fields')
+    t.equal(entry.linkpath, '', type + ' does not get ex linkpath')
+    t.equal(entry.x, undefined, type + ' does not get ex fields')
+    t.equal(entry.z, undefined, type + ' does not get gex fields')
+  })
+
+  // normal entries still get the extended header fields
+  const h = new Header({ path: 'innocent.txt', size: 23, type: 'File' })
+  h.encode()
+  const entry = new ReadEntry(new Header(h.block, 0, ex, gex), ex, gex)
+  t.match(entry, {
+    meta: false,
+    type: 'File',
+    path: 'smuggled/evil.txt',
+    linkpath: 'smuggled/target',
+    size: gex.size,
+    uid: 1234,
+    gid: 4321,
+    x: 'y',
+    z: 'w'
+  }, 'file entry respects extended headers')
+
+  t.end()
+})
