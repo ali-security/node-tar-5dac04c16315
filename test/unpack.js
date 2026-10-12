@@ -4773,3 +4773,125 @@ t.test('numeric pax linkpath', {
 
   t.end()
 })
+
+t.test('max decompression ratio', t => {
+  const zlib = require('zlib')
+  const size = 8 * 1024 * 1024
+  // NB: make-tar.js truncates every chunk to a single 512 byte block, so the
+  // bomb payload has to be concatenated onto the header blocks by hand.
+  const data = zlib.gzipSync(Buffer.concat([
+    makeTar([
+      {
+        path: 'bomb',
+        size: size,
+        type: 'File'
+      }
+    ]),
+    Buffer.alloc(size),
+    makeTar(['', ''])
+  ]))
+
+  const dir = path.resolve(unpackdir, 'decompression-bomb')
+  // each case gets its own cwd, since an aborted unpack may still be
+  // flushing out what it had already read when the next case starts
+  const setup = name => {
+    const cwd = path.resolve(dir, name)
+    rimraf.sync(cwd)
+    mkdirp.sync(cwd)
+    return cwd
+  }
+  t.teardown(_ => rimraf.sync(dir))
+
+  const expectAbort = {
+    tarCode: 'TAR_ABORT',
+    recoverable: false,
+    message: /^max decompression ratio exceeded: /
+  }
+
+  t.test('aborts compressed bombs by default', t => {
+    t.plan(2)
+    const errors = []
+    new Unpack({ cwd: setup('async') })
+      .on('error', er => {
+        errors.push(er)
+        if (errors.length === 1)
+          t.match(er, expectAbort, 'async aborts')
+      })
+      .end(data)
+
+    t.throws(() => new UnpackSync({ cwd: setup('sync') }).end(data),
+      expectAbort, 'sync throws')
+  })
+
+  t.test('stops writing the payload at a low limit', t => {
+    const cwd = setup('low')
+    const errors = []
+    new UnpackSync({ cwd, maxDecompressionRatio: 4 })
+      .on('error', er => errors.push(er))
+      .end(data)
+    t.equal(errors.length, 1, 'aborted once')
+    t.match(errors[0], expectAbort, 'aborted on the ratio')
+    const bomb = path.resolve(cwd, 'bomb')
+    const written = fs.existsSync(bomb) ? fs.statSync(bomb).size : 0
+    t.ok(written < size / 100,
+      `stopped writing the payload early (${written} < ${size / 100})`)
+    t.end()
+  })
+
+  t.test('can be disabled explicitly', t => {
+    const cwd = setup('disabled')
+    const u = new Unpack({
+      cwd,
+      maxDecompressionRatio: Infinity
+    })
+    u.on('error', er => t.fail(er.message))
+    u.on('close', () => {
+      t.equal(fs.statSync(path.resolve(cwd, 'bomb')).size, size)
+      t.end()
+    })
+    u.end(data)
+  })
+
+  t.test('can be disabled explicitly, sync', t => {
+    const cwd = setup('disabled-sync')
+    new UnpackSync({ cwd, maxDecompressionRatio: Infinity }).end(data)
+    t.equal(fs.statSync(path.resolve(cwd, 'bomb')).size, size)
+    t.end()
+  })
+
+  t.test('aborting disposes the decompressor so it stops expanding', t => {
+    // abort() must dispose the unzip stream, otherwise the decompressor
+    // keeps expanding the whole bomb into memory after the ratio abort fires.
+    const payloadSize = 20 * 1024 * 1024
+    const bigData = zlib.gzipSync(Buffer.concat([
+      makeTar([
+        {
+          path: 'bomb',
+          size: payloadSize,
+          type: 'File'
+        }
+      ]),
+      Buffer.alloc(payloadSize),
+      makeTar(['', ''])
+    ]))
+    const cwd = setup('dispose')
+    const u = new Unpack({ cwd, maxDecompressionRatio: 2 })
+    let aborted = false
+    u.on('error', er => {
+      aborted = er.tarCode === 'TAR_ABORT'
+    })
+    u.end(bigData)
+    // give any un-disposed decompressor time to keep expanding; with the fix
+    // the decompressed byte count stays pinned near where the ratio tripped.
+    setTimeout(() => {
+      t.ok(aborted, 'aborted with TAR_ABORT')
+      const sym = Object.getOwnPropertySymbols(u)
+        .filter(s => s.toString() === 'Symbol(decompressedBytesRead)')[0]
+      t.ok(u[sym] < payloadSize,
+        `decompression stopped early: ${u[sym]} < ${payloadSize}`)
+      t.end()
+    }, 500)
+  })
+
+  t.end()
+})

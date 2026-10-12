@@ -1023,3 +1023,214 @@ t.test('CVE-2026-59874', t => {
 
   t.end()
 })
+
+t.test('max decompression ratio', t => {
+  const size = 8 * 1024 * 1024
+  // NB: make-tar.js truncates every chunk to a single 512 byte block, so the
+  // bomb payload has to be concatenated onto the header blocks by hand.
+  const bomb = zlib.gzipSync(Buffer.concat([
+    makeTar([
+      {
+        path: 'bomb',
+        size: size,
+        type: 'File'
+      }
+    ]),
+    Buffer.alloc(size),
+    makeTar(['', ''])
+  ]))
+  // an all-zeros gzip lands at roughly 1020:1, just over the default limit
+  const ratioLimitThatFits = 1500
+
+  const getSymbol = (obj, name) => Object.getOwnPropertySymbols(obj)
+    .filter(s => s.toString() === `Symbol(${name})`)[0]
+
+  const expectAbort = {
+    tarCode: 'TAR_ABORT',
+    code: 'TAR_ABORT',
+    recoverable: false,
+    message: /^max decompression ratio exceeded: [0-9.]+ > /
+  }
+
+  t.test('parsing aborts by default', t => {
+    const p = new Parse({})
+    t.equal(p.maxDecompressionRatio, 1000, 'default limit')
+    t.throws(() => p.end(bomb), expectAbort, 'parsing aborts')
+    // no-op to abort again
+    p.abort(new Error('hello'))
+    t.end()
+  })
+
+  t.test('aborting only happens one time', t => {
+    const p = new Parse({})
+    t.throws(() => p.abort(new Error('hello')), {
+      message: 'hello',
+      tarCode: 'TAR_ABORT',
+      recoverable: false
+    })
+    // this is ignored
+    p.end(bomb)
+    t.end()
+  })
+
+  t.test('abort with an error listener, consumption stops at the limit', t => {
+    let bytesRead = 0
+    const p = new Parse({
+      maxDecompressionRatio: 4,
+      onentry: entry => {
+        entry.on('data', c => bytesRead += c.length)
+        entry.resume()
+      }
+    })
+    const errors = []
+    p.on('error', er => errors.push(er))
+    let aborted = 0
+    p.on('abort', _ => aborted++)
+    let ended = false
+    p.on('end', _ => ended = true)
+    p.end(bomb)
+    t.equal(aborted, 1, 'aborted exactly once')
+    t.equal(errors.length, 1, 'one error raised')
+    t.match(errors[0], expectAbort, 'error is the ratio abort')
+    t.match(errors[0].message, / > 4$/, 'reports the configured limit')
+    t.equal(ended, false, 'parse did not complete')
+    t.ok(bytesRead < size / 100,
+      `stopped delivering entry data early (${bytesRead} < ${size / 100})`)
+    const decompressed = p[getSymbol(p, 'decompressedBytesRead')]
+    t.ok(decompressed > 0 && decompressed < size / 100,
+      `stopped decompressing at the limit (${decompressed} < ${size / 100})`)
+
+    // writing more after the abort is ignored
+    p.write(bomb)
+    p.end(bomb)
+    t.equal(p[getSymbol(p, 'decompressedBytesRead')], decompressed,
+      'nothing more decompressed after the abort')
+    t.equal(errors.length, 1, 'no further errors')
+    t.end()
+  })
+
+  t.test('aborting disposes the decompressor', t => {
+    const p = new Parse({ maxDecompressionRatio: 2 })
+    const errors = []
+    p.on('error', er => errors.push(er))
+    // hand it over the way a stream would, in pieces
+    p.write(bomb.slice(0, 1024))
+    t.match(errors, [expectAbort], 'aborted on the first piece')
+    const u = p[getSymbol(p, 'unzip')]
+    t.equal(u[getSymbol(u, 'handle')], null, 'zlib binding was released')
+    // a lingering reference to the decompressor can no longer feed it
+    t.equal(u.write(bomb.slice(1024)), true, 'write is inert')
+    t.equal(u.end(), u, 'end is inert')
+    t.equal(u.emit('data', Buffer.alloc(512)), false, 'emit is inert')
+    const decompressed = p[getSymbol(p, 'decompressedBytesRead')]
+    t.ok(decompressed > 0 && decompressed < size / 100,
+      `decompression stopped early (${decompressed} < ${size / 100})`)
+    t.equal(errors.length, 1, 'only aborted once')
+    t.end()
+  })
+
+  t.test('a ratio that fits is allowed', t => {
+    let bytesRead = 0
+    const p = new Parse({
+      maxDecompressionRatio: ratioLimitThatFits,
+      onentry: entry => {
+        entry.on('data', c => bytesRead += c.length)
+        entry.resume()
+      }
+    })
+    p.on('error', er => t.fail(er.message))
+    p.on('end', _ => {
+      t.equal(bytesRead, size, 'read the entire payload')
+      t.end()
+    })
+    p.end(bomb)
+  })
+
+  t.test('compressed bytes are counted on every write and on end', t => {
+    // Each of the three pieces is needed to keep the ratio under the limit:
+    // if any of them were not counted as compressed input, the ratio would
+    // come out at roughly double the real one, and the parse would abort.
+    const half = Math.floor(bomb.length / 2)
+    let bytesRead = 0
+    const p = new Parse({
+      maxDecompressionRatio: ratioLimitThatFits,
+      onentry: entry => {
+        entry.on('data', c => bytesRead += c.length)
+        entry.resume()
+      }
+    })
+    p.on('error', er => t.fail(er.message))
+    p.on('end', _ => {
+      t.equal(bytesRead, size, 'read the entire payload')
+      t.end()
+    })
+    p.write(bomb.slice(0, 100))
+    p.write(bomb.slice(100, half))
+    p.end(bomb.slice(half))
+  })
+
+  t.test('ending a gzipped stream without a final chunk', t => {
+    let bytesRead = 0
+    const p = new Parse({
+      maxDecompressionRatio: ratioLimitThatFits,
+      onentry: entry => {
+        entry.on('data', c => bytesRead += c.length)
+        entry.resume()
+      }
+    })
+    p.on('error', er => t.fail(er.message))
+    p.on('end', _ => {
+      t.equal(bytesRead, size, 'read the entire payload')
+      t.end()
+    })
+    p.write(bomb)
+    p.end()
+  })
+
+  t.test('parsing can disable the limit explicitly', t => {
+    let bytesRead = 0
+    const p = new Parse({
+      maxDecompressionRatio: Infinity,
+      onentry: entry => {
+        entry.on('data', c => bytesRead += c.length)
+        entry.resume()
+      }
+    })
+    p.on('error', er => t.fail(er.message))
+    p.on('end', _ => {
+      t.equal(bytesRead, size, 'read the entire payload')
+      t.end()
+    })
+    p.end(bomb)
+  })
+
+  t.test('uncompressed archives are not limited', t => {
+    // the ratio only applies to gzipped input
+    let bytesRead = 0
+    const p = new Parse({
+      maxDecompressionRatio: 0,
+      onentry: entry => {
+        entry.on('data', c => bytesRead += c.length)
+        entry.resume()
+      }
+    })
+    p.on('error', er => t.fail(er.message))
+    p.on('end', _ => {
+      t.equal(bytesRead, 1024, 'read the entire payload')
+      t.end()
+    })
+    p.end(Buffer.concat([
+      makeTar([
+        {
+          path: 'plain',
+          size: 1024,
+          type: 'File'
+        }
+      ]),
+      Buffer.alloc(1024),
+      makeTar(['', ''])
+    ]))
+  })
+
+  t.end()
+})

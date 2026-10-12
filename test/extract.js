@@ -289,3 +289,73 @@ for (const strict of [true, false]) {
     }
   }
 }
+
+t.test('max decompression ratio', t => {
+  const zlib = require('zlib')
+  const size = 8 * 1024 * 1024
+  const dir = path.resolve(extractdir, 'decompression-bomb')
+  const file = path.resolve(dir, 'bomb.tgz')
+  rimraf.sync(dir)
+  mkdirp.sync(dir)
+  t.teardown(_ => rimraf.sync(dir))
+
+  // NB: make-tar.js truncates every chunk to a single 512 byte block, so the
+  // bomb payload has to be concatenated onto the header blocks by hand.
+  fs.writeFileSync(file, zlib.gzipSync(Buffer.concat([
+    makeTar([
+      {
+        path: 'bomb',
+        size: size,
+        type: 'File'
+      }
+    ]),
+    Buffer.alloc(size),
+    makeTar(['', ''])
+  ])))
+
+  // each case gets its own cwd, since an aborted async extraction may still
+  // be flushing out what it had already read when the next case starts
+  const setup = name => {
+    const cwd = path.resolve(dir, name)
+    mkdirp.sync(cwd)
+    return cwd
+  }
+
+  const expectAbort = {
+    tarCode: 'TAR_ABORT',
+    recoverable: false,
+    message: /^max decompression ratio exceeded: /
+  }
+
+  t.test('file extraction aborts by default', t => {
+    t.throws(() => x({ sync: true, file, cwd: setup('sync') }), expectAbort,
+      'sync throws')
+    return x({ file, cwd: setup('async') }).then(() => {
+      t.fail('extraction should not have completed')
+    }, er => t.match(er, expectAbort, 'async rejects'))
+  })
+
+  t.test('file extraction stops writing at a low limit', t => {
+    const cwd = setup('low')
+    t.throws(() => x({ sync: true, file, cwd, maxDecompressionRatio: 4 }),
+      expectAbort, 'sync throws')
+    const bomb = path.resolve(cwd, 'bomb')
+    const written = fs.existsSync(bomb) ? fs.statSync(bomb).size : 0
+    t.ok(written < size / 100,
+      `stopped writing the payload early (${written} < ${size / 100})`)
+    t.end()
+  })
+
+  t.test('file extraction can disable the limit explicitly', t => {
+    const cwd = setup('disabled')
+    return x({
+      file,
+      cwd,
+      maxDecompressionRatio: Infinity
+    }).then(() => {
+      t.equal(fs.statSync(path.resolve(cwd, 'bomb')).size, size)
+    })
+  })
+
+  t.end()
+})
