@@ -192,6 +192,98 @@ t.test('read fail', t => {
   t.end()
 })
 
+// GHSA-r292-9mhp-454m / CVE-2026-73566: mapHas recursion depth must be bounded
+t.test('GHSA-r292-9mhp-454m: deep path does not overflow stack', t => {
+  const makeTar = require('./make-tar.js')
+  // A plain ustar header can only carry ~255 bytes of path, so keep the
+  // segments short enough that the whole path survives the encoding.
+  const deepPath = Array.from({ length: 45 }, (_, i) => 'x' + i).join('/')
+  const data = makeTar([
+    { path: deepPath, type: 'File', size: 0 },
+    '',
+    '',
+  ])
+
+  const listed = []
+  const ignored = []
+  // Pass a files filter that does NOT include deepPath — this triggers mapHas
+  // to walk all the way up to root one dirname() at a time.
+  const p = list(
+    { onentry: e => listed.push(e.path) },
+    ['some/other/path'],
+  )
+  p.on('ignoredEntry', e => ignored.push(e.path))
+  p.on('end', () => {
+    // deepPath was not in files list; it (and its parents) should be filtered out
+    t.equal(listed.length, 0, 'no entries listed for unmatched deep path')
+    t.same(ignored, [deepPath], 'full deep path reached the filter')
+    t.end()
+  })
+  p.on('error', er => { throw er })
+  p.end(data)
+})
+
+t.test('CVE-2026-73566: GNU long path with 100000 segments', t => {
+  const makeTar = require('./make-tar.js')
+  // far deeper than the call stack can recurse, well under maxMetaEntrySize
+  const deepPath = 'x/'.repeat(99999) + 'x'
+  const size = Buffer.byteLength(deepPath)
+  const body = Buffer.alloc(Math.ceil(size / 512) * 512)
+  body.write(deepPath)
+  // make-tar.js clips each chunk to 512 bytes, so the long body of the
+  // NextFileHasLongPath ('L') meta entry is concatenated around it.
+  const data = Buffer.concat([
+    makeTar([{ path: '././@LongLink', type: 'NextFileHasLongPath', size }]),
+    body,
+    makeTar([
+      { path: 'placeholder', type: 'File', size: 0 },
+      { path: 'some/dir/', type: 'Directory', mode: 0o755 },
+      { path: 'some/dir/a/b/c.txt', type: 'File', size: 0, mode: 0o644 },
+      { path: 'other/file.txt', type: 'File', size: 0, mode: 0o644 },
+      '',
+      '',
+    ]),
+  ])
+
+  const listed = []
+  const ignored = []
+  const p = list({ onentry: e => listed.push(e.path) }, ['some/dir'])
+  p.on('ignoredEntry', e => ignored.push(e.path))
+  p.on('end', () => {
+    t.equal(ignored.length, 2, 'two entries ignored')
+    t.equal(ignored[0].length, deepPath.length, 'long path applied to entry')
+    t.ok(ignored[0] === deepPath, 'deep unmatched path filtered out')
+    t.equal(ignored[1], 'other/file.txt', 'unselected sibling filtered out')
+    t.same(listed, ['some/dir/', 'some/dir/a/b/c.txt'],
+      'selected dir and its children still listed after the deep entry')
+    t.end()
+  })
+  try {
+    p.end(data)
+  } catch (er) {
+    t.fail('listing threw: ' + er.name + ': ' + er.message)
+    t.end()
+  }
+})
+
+t.test('CVE-2026-73566: files filter bounds mapHas recursion', t => {
+  const deepPath = 'x/'.repeat(99999) + 'x'
+  const p = list({}, ['some/other/path'])
+  let ret
+  t.doesNotThrow(() => {
+    ret = p.filter(deepPath, {})
+  }, 'deep path does not overflow the stack')
+  t.equal(ret, false, 'deep unmatched path is not selected')
+
+  // legit nesting up to the limit below a selected dir is still selected
+  const within = list({}, ['some/dir'])
+  t.equal(within.filter('some/dir' + '/y'.repeat(99), {}), true,
+    '99 levels below a selected dir is selected')
+  t.equal(within.filter('some/other', {}), false,
+    'unselected shallow path is not selected')
+  t.end()
+})
+
 t.test('noResume option', t => {
   const file = path.resolve(__dirname, 'fixtures/tars/file.tar')
   t.test('sync', t => {
