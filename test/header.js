@@ -739,3 +739,41 @@ t.test('do not apply any ex/gex field to meta entries', t => {
 
   t.end()
 })
+
+t.test('no negative size', t => {
+  const i = new Header({ size: -1000 })
+  // stubbornly refuse
+  t.equal(i.size, null)
+  t.end()
+})
+
+t.test('no negative size in a decoded header', t => {
+  // A negative size means a negative body length, which no consumer can
+  // ever read past (CVE-2026-59874).  Drop it however the block encodes it.
+
+  // base-256 (0xff prefix) negative size, the way a hostile archive would
+  // carry it.  Set it on the instance so it goes around the guard in set().
+  const h = new Header({ path: 'negative-size', size: 0 })
+  h.size = -1000
+  const b256 = Buffer.alloc(512)
+  h.encode(b256, 0)
+  t.equal(b256[124], 0xff, 'size field is base-256 negative')
+  const d = new Header(b256)
+  t.equal(d.cksumValid, true, 'block is otherwise a valid header')
+  t.equal(d.path, 'negative-size', 'the rest of the header is read')
+  t.equal(d.size, null, 'base-256 negative size is dropped')
+
+  // octal size field with a leading minus sign
+  const oct = Buffer.alloc(512)
+  new Header({ path: 'negative-size', size: 0 }).encode(oct, 0)
+  oct.write('-0000001750\0', 124, 12, 'ascii')
+  const o = new Header(oct)
+  t.equal(o.path, 'negative-size', 'the rest of the header is read')
+  t.equal(o.size, null, 'octal negative size is dropped')
+
+  // non-negative sizes are still read
+  const p = new Header({ path: 'positive-size', size: 1000 })
+  p.encode()
+  t.equal(new Header(p.block).size, 1000, 'positive size is kept')
+  t.end()
+})

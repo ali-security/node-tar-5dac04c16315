@@ -909,3 +909,117 @@ t.test('CVE-2026-53655', t => {
 
   t.end()
 })
+
+// CVE-2026-59874 - negative entry size.
+//
+// A negative size, whether it is carried in the header block itself or in a
+// pax extended header, gives the entry a negative body length that can never
+// be consumed, so the parser can never advance past it.  Refuse it.
+t.test('CVE-2026-59874', t => {
+  const parseEntries = (data, cb) => {
+    const entries = []
+    const warnings = []
+    const p = new Parse({
+      onwarn: (code, msg) => warnings.push([code, msg]),
+      onentry: entry => {
+        entries.push([entry.path, entry.size])
+        entry.resume()
+      },
+    })
+    p.on('end', _ => cb(entries, warnings))
+    p.end(data)
+  }
+
+  t.test('negative size in the header block', t => {
+    const h = new Header({ path: 'negative.txt', type: 'File', size: 0 })
+    // set it on the instance so it goes around the guard in set(), and a
+    // negative (base-256) size is really encoded into the block
+    h.size = -1000
+    const block = Buffer.alloc(512)
+    h.encode(block, 0)
+    const data = makeTar([
+      block,
+      {
+        path: 'after.txt',
+        type: 'File',
+        size: 1,
+      },
+      'x',
+      '',
+      '',
+    ])
+
+    parseEntries(data, (entries, warnings) => {
+      t.same(warnings, [], 'stream stayed in sync')
+      t.same(entries, [['negative.txt', null], ['after.txt', 1]],
+        'negative size dropped, following entry still read')
+      t.end()
+    })
+  })
+
+  t.test('negative size in a pax extended header', t => {
+    const paxBody = '14 size=-1000\n'
+    const data = makeTar([
+      {
+        path: 'PaxHeader/negative.txt',
+        type: 'ExtendedHeader',
+        size: paxBody.length,
+      },
+      paxBody,
+      {
+        path: 'negative.txt',
+        type: 'File',
+        size: 0,
+      },
+      {
+        path: 'after.txt',
+        type: 'File',
+        size: 1,
+      },
+      'x',
+      '',
+      '',
+    ])
+
+    parseEntries(data, (entries, warnings) => {
+      t.same(warnings, [], 'stream stayed in sync')
+      t.same(entries, [['negative.txt', 0], ['after.txt', 1]],
+        'pax negative size ignored, following entry still read')
+      t.end()
+    })
+  })
+
+  t.test('negative size in a global pax extended header', t => {
+    const paxBody = '14 size=-1000\n'
+    const data = makeTar([
+      {
+        path: 'PaxHeader/global',
+        type: 'GlobalExtendedHeader',
+        size: paxBody.length,
+      },
+      paxBody,
+      {
+        path: 'negative.txt',
+        type: 'File',
+        size: 0,
+      },
+      {
+        path: 'after.txt',
+        type: 'File',
+        size: 1,
+      },
+      'x',
+      '',
+      '',
+    ])
+
+    parseEntries(data, (entries, warnings) => {
+      t.same(warnings, [], 'stream stayed in sync')
+      t.same(entries, [['negative.txt', 0], ['after.txt', 1]],
+        'global pax negative size ignored, following entries still read')
+      t.end()
+    })
+  })
+
+  t.end()
+})

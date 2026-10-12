@@ -7,6 +7,7 @@ const mkdirp = require('mkdirp')
 const rimraf = require('rimraf')
 const mutateFS = require('mutate-fs')
 const list = require('../lib/list.js')
+const Header = require('../lib/header.js')
 
 const fixtures = path.resolve(__dirname, 'fixtures')
 const dir = path.resolve(fixtures, 'replace')
@@ -337,6 +338,56 @@ t.test('create tarball out of another tarball', t => {
       f: out,
       cwd: tars
     }, ['@utf8.tar'], _ => check(t))
+  })
+
+  t.end()
+})
+
+t.test('negative size in an existing archive header', t => {
+  // CVE-2026-59874: a negative size makes the walk over the existing
+  // headers step back onto the same block forever, so replace never returns.
+  const negFile = path.resolve(dir, 'negative-size.tar')
+  const addFile = 'negative-size-added.txt'
+
+  t.beforeEach(cb => {
+    mkdirp.sync(dir)
+    const h = new Header({ path: 'negative.txt', type: 'File', size: 0 })
+    // set it on the instance so it goes around the guard in set(), and a
+    // negative (base-256) size is really encoded into the block
+    h.size = -1000
+    const block = Buffer.alloc(512)
+    h.encode(block, 0)
+    fs.writeFileSync(negFile, Buffer.concat([block, Buffer.alloc(1024)]))
+    fs.writeFileSync(path.resolve(dir, addFile), 'added\n')
+    cb()
+  })
+
+  const check = t => {
+    const entries = []
+    list({ f: negFile, sync: true, onentry: entry => {
+      entries.push(entry.path)
+    }})
+    t.same(entries, ['negative.txt', addFile])
+    t.end()
+  }
+
+  t.test('sync', t => {
+    r({
+      f: negFile,
+      cwd: dir,
+      sync: true
+    }, [addFile])
+    check(t)
+  })
+
+  t.test('async', t => {
+    r({
+      f: negFile,
+      cwd: dir
+    }, [addFile], er => {
+      t.error(er)
+      check(t)
+    })
   })
 
   t.end()
