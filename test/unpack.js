@@ -3310,3 +3310,144 @@ t.test('failed symlink does not stall the unpack on windows', t => {
 
   t.end()
 })
+
+t.test('recognize C:.. as a dot path part on windows', t => {
+  // drive-relative paths like `C:foo` resolve against the cwd of the C:
+  // drive on windows, not against the extraction target, so their drive
+  // root must be stripped, and `C:..` must be treated as a `..` part.
+  const WinUnpack = loadWinUnpack()
+  const dir = path.resolve(unpackdir, 'win32-drive-relative')
+  t.teardown(() => rimraf.sync(dir))
+
+  const data = makeTar([
+    {
+      path: 'C:../x/y/z',
+      type: 'File',
+      size: 1,
+    },
+    'a',
+    {
+      path: 'x:..\\y\\z',
+      type: 'File',
+      size: 1,
+    },
+    'x',
+    {
+      path: 'Y:foo',
+      type: 'File',
+      size: 1,
+    },
+    'y',
+    '',
+    '',
+  ])
+
+  const check = (t, cwd, warnings) => {
+    t.strictSame(warnings, [
+      ['TAR_ENTRY_ERROR', 'path contains \'..\'', 'C:../x/y/z'],
+      ['TAR_ENTRY_ERROR', 'path contains \'..\'', 'x:../y/z'],
+      ['TAR_ENTRY_INFO', 'stripping Y: from absolute path', 'Y:foo'],
+    ])
+    t.strictSame(fs.readdirSync(cwd), ['foo'],
+      'only the stripped drive-relative entry was extracted')
+    t.equal(fs.readFileSync(cwd + '/foo', 'utf8'), 'y')
+    t.end()
+  }
+
+  t.test('async', t => {
+    const cwd = path.resolve(dir, 'async')
+    rimraf.sync(cwd)
+    mkdirp.sync(cwd)
+    const warnings = []
+    new WinUnpack({
+      cwd,
+      onwarn: (c, w, d) => warnings.push([c, w, d.path]),
+    }).on('close', () => check(t, cwd, warnings)).end(data)
+  })
+
+  t.test('sync', t => {
+    const cwd = path.resolve(dir, 'sync')
+    rimraf.sync(cwd)
+    mkdirp.sync(cwd)
+    const warnings = []
+    new WinUnpack.Sync({
+      cwd,
+      onwarn: (c, w, d) => warnings.push([c, w, d.path]),
+    }).end(data)
+    check(t, cwd, warnings)
+  })
+
+  t.end()
+})
+
+t.test('drive-relative paths do not escape the extraction target', t => {
+  // stripping the `c:` drive root from `c:../escape` leaves `../escape`,
+  // which must not be written outside of the cwd on any platform.
+  const dir = path.resolve(unpackdir, 'drive-relative-escape')
+  t.teardown(() => rimraf.sync(dir))
+
+  const data = makeTar([
+    {
+      path: 'c:../escape',
+      type: 'File',
+      size: 'pwned'.length,
+    },
+    'pwned',
+    {
+      path: 'c:..',
+      type: 'Directory',
+    },
+    {
+      path: 'safe',
+      type: 'File',
+      size: 'safe'.length,
+    },
+    'safe',
+    '',
+    '',
+  ])
+
+  const msg = process.platform === 'win32' ? 'path contains \'..\''
+    : 'path escaped extraction target'
+
+  const check = (t, base, warnings) => {
+    const cwd = base + '/cwd'
+    t.strictSame(fs.readdirSync(base), ['cwd'],
+      'nothing written outside of cwd')
+    t.strictSame(fs.readdirSync(cwd), ['safe'], 'only safe entry extracted')
+    t.equal(fs.readFileSync(cwd + '/safe', 'utf8'), 'safe')
+    t.strictSame(warnings.filter(w => w[0] === 'TAR_ENTRY_ERROR'), [
+      ['TAR_ENTRY_ERROR', msg],
+      ['TAR_ENTRY_ERROR', msg],
+    ])
+    t.end()
+  }
+
+  const setup = base => {
+    rimraf.sync(base)
+    mkdirp.sync(base + '/cwd')
+  }
+
+  t.test('async', t => {
+    const base = path.resolve(dir, 'async')
+    setup(base)
+    const warnings = []
+    new Unpack({
+      cwd: base + '/cwd',
+      onwarn: (c, w) => warnings.push([c, w]),
+    }).on('close', () => check(t, base, warnings)).end(data)
+  })
+
+  t.test('sync', t => {
+    const base = path.resolve(dir, 'sync')
+    setup(base)
+    const warnings = []
+    new UnpackSync({
+      cwd: base + '/cwd',
+      onwarn: (c, w) => warnings.push([c, w]),
+    }).end(data)
+    check(t, base, warnings)
+  })
+
+  t.end()
+})
