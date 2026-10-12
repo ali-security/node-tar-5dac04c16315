@@ -1,6 +1,11 @@
 language: node_js
 
+env:
+  global:
+    - TAP_COLORS=0
+    - FORCE_COLOR=0
+
 node_js:
-  - node
+  - 14
   - 12
   - 10

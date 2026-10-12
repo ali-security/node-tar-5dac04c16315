@@ -2528,7 +2528,11 @@ t.test('trying to unpack a javascript file should fail', t => {
     new Unpack(opts)
       .once('error', er => t.match(er, expect, 'async emits'))
       .end(dataGzip)
-    t.throws(() => new UnpackSync(opts).end(dataGzip), expect, 'sync throws')
+    const skip = !/^v([0-9]|1[0-3])\./.test(process.version) ? false
+      : 'node prior to v14 did not raise sync zlib errors properly'
+
+    t.throws(() => new UnpackSync(opts).end(dataGzip),
+      expect, 'sync throws', { skip })
   })
 
   t.test('bad archive if no gzip', t => {
